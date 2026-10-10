@@ -1,0 +1,1613 @@
+// ─────────────────────────────────────────────
+// SYNC — logical clocks for offline-first merge.
+//
+// There is no network here yet. This file exists so that by the time a backend
+// lands, every edit already carries a timestamp saying when this device made
+// it — retrofitting that later would leave all pre-existing progress
+// indistinguishable from "never touched".
+//
+// The unit is a FIELD, not a blob. localStorage stores progress in five
+// buckets (state/ctrs/cur/chartRow/grows), but a clock per bucket would call
+// it a conflict whenever two devices touched any two steps. So each clock key
+// names one field:
+//
+//   s:<stepId>     a step's done-flag (including '<stepId>__b<i>' sub-steps)
+//   c:<stepId>     a step's row counter
+//   cur            which phase is open
+//   cr:<phaseId>   that chart phase's current row
+//   global_rows    the project-wide row tally
+//
+// Ticking three Materials steps on a phone while an iPad sits on chart row 31
+// touches disjoint keys, so both survive with nothing to ask the user about.
+// ─────────────────────────────────────────────
+
+// Chart rows are per-phase (see chartRows in state.js): a pattern can have
+// several charts, each with its own position. The clock key has to match that
+// granularity — one shared key would make a device on the gauge swatch and a
+// device on the raglan look like they were fighting over the same row.
+function chartRowKey(phaseId) { return 'cr:' + phaseId; }
+
+// Difference between this device's clock and the server's, learned once per
+// session (see learnServerSkew).
+let serverSkew = 0;
+
+// A phone whose clock is three days fast would otherwise win every merge
+// forever, and there is no way to repair timestamps already written. Clamping
+// caps the damage at an hour.
+const MAX_SKEW_MS = 60 * 60 * 1000;
+
+// Below this, the "skew" is round-trip latency and the one-second resolution
+// of the Date header, not a wrong clock.
+const SKEW_MIN_MS = 5000;
+
+// Never hand out a stamp at or below one this device has already written.
+//
+// Correcting a fast clock moves time BACKWARDS, and a new edit stamped earlier
+// than an older one is invisible to the merge: clocks[k] never exceeds
+// base[k], so the field reads as unchanged and is never pushed. The knitter
+// counts rows all evening and none of them leave the phone, with nothing on
+// screen to say so. The floor makes the correction safe to apply.
+//
+// It is seeded from clocks already on disk, which can include ones merged in
+// from another device — so this device's stamps can end up slightly ahead of
+// its own wall clock. That is what a logical clock is, and it is bounded by
+// the same ±1h clamp on every device.
+let stampFloor = 0;
+function noteExistingClocks(map) {
+  Object.keys(map || {}).forEach(k => { if (map[k] > stampFloor) stampFloor = map[k]; });
+}
+
+function syncNow() {
+  const skew = Math.max(-MAX_SKEW_MS, Math.min(MAX_SKEW_MS, serverSkew));
+  const t = Math.max(Date.now() + skew, stampFloor + 1);
+  stampFloor = t;
+  return t;
+}
+
+// The server's clock, read once per session from the Date header. This exists
+// to catch a device that is days out, not to keep time.
+//
+// It has to be a plain fetch — the supabase client gives no access to response
+// headers — and it has to be the REST endpoint specifically. Cross-origin,
+// only CORS-safelisted response headers are readable unless the server opts in
+// with Access-Control-Expose-Headers, and `date` is NOT on that safelist:
+// /rest/v1 exposes it (Cloudflare does the opt-in), /auth/v1/health does not,
+// and /auth/v1/health rejects HEAD with a 405 into the bargain. Verified by
+// reading the exposed header list off both.
+//
+// A GET with limit=0 returns an empty array under RLS whether or not anyone is
+// signed in, so this costs two bytes of body and needs no session.
+async function learnServerSkew() {
+  try {
+    const res = await fetch(SUPABASE_URL + '/rest/v1/projects?select=id&limit=0',
+      { cache: 'no-store', headers: { apikey: SUPABASE_KEY } });
+    const raw = res.headers.get('date');
+    const serverMs = Date.parse(raw || '');
+    if (!serverMs) {
+      // Logged rather than swallowed: silence here is indistinguishable from
+      // "the clocks agree", and this whole guard would be dead code.
+      logSync('warn', 'server Date header unreadable — using local time');
+      return;
+    }
+    const skew = serverMs - Date.now();
+    // The header has one-second resolution and the round trip adds more, so
+    // anything small is noise, not a wrong clock.
+    serverSkew = Math.abs(skew) < SKEW_MIN_MS ? 0 : skew;
+    if (serverSkew) logSync('info', 'device clock is ' + Math.round(-skew / 1000) +
+      's ahead of the server — correcting new timestamps');
+  } catch (e) {
+    // No correction means local time is used, which is exactly what every
+    // version before this one did.
+    logSync('warn', 'could not read server time — using local time', e);
+  }
+}
+
+// Record that this device just changed `key`.
+//
+// Called at the mutation site rather than inside save(), which writes all five
+// buckets every time and so cannot tell which field actually moved. The write
+// to localStorage is left to the save() that each mutator already performs —
+// stamping is a memory update, adding nothing to the chart-row tap path.
+function stampClock(key) {
+  if (!activeProjectId) return;
+  clocks[key] = syncNow();
+}
+
+function stampClocks(keys) {
+  keys.forEach(stampClock);
+}
+
+// True if `key` has been changed on this device since the last successful
+// sync. Absent from `clocks` means never touched; absent from `baseClocks`
+// means never synced, so any clock at all counts as a local edit.
+function isDirty(key) {
+  return (clocks[key] || 0) > (baseClocks[key] || 0);
+}
+
+// ─────────────────────────────────────────────
+// FIELD-KEY ADAPTERS
+//
+// Three representations of the same progress, and everything below converts
+// between them:
+//
+//   localStorage   five buckets — state / ctrs / cur / chartRows / grows
+//   field keys     one flat map, {'s:collar-1': true, 'cr:yoke': 31, …}
+//   server columns steps / counters / cur / chart_rows / global_rows
+//
+// The flat form is the only one the merge can work in — a clock per bucket
+// would call it a conflict whenever two devices touched any two steps — while
+// the other two are fixed by what already exists on disk and in Postgres. So
+// the conversion is not incidental plumbing; it is the seam that lets the
+// merge stay per-field without rewriting how the app saves.
+//
+// Values are compared with === in diffProgress(), so the types have to survive
+// a JSON round trip through Postgres unchanged: booleans stay booleans and
+// counters stay integers, never the strings localStorage would hand back.
+// ─────────────────────────────────────────────
+function projKey(projectId, suffix) { return 'pt3_proj_' + projectId + '_' + suffix; }
+
+function lsGet(projectId, suffix) {
+  try { return localStorage.getItem(projKey(projectId, suffix)); } catch(e) { return null; }
+}
+function lsGetJson(projectId, suffix, fallback) {
+  try { return JSON.parse(lsGet(projectId, suffix) || 'null') || fallback; } catch(e) { return fallback; }
+}
+
+// Which phase a pre-per-phase `chartRow` scalar belonged to: the pattern's only
+// chart phase. Shared with migrateAddClocks() so the clock and the value can
+// never be attributed to different phases.
+function legacyChartPhaseId(projectId) {
+  const proj = projects.find(p => p.id === projectId);
+  const pat = proj && patternById(proj.patternId);
+  const phase = pat && pat.phases.find(ph => ph.hasChart);
+  return phase ? phase.id : null;
+}
+
+// A project's saved progress as { values, clocks } in field-key space.
+//
+// Read from localStorage even for the project that is currently open, rather
+// than from the live globals: every mutator calls save() before anything can
+// reach here, so the two agree, and one source means the merge cannot see a
+// different project state than the one that would survive a reload.
+function readLocalProgress(projectId) {
+  const values = {};
+  // Entry progress. `state`/`ctrs`/`grows` are NOT read any more: they are
+  // pre-conversion relics that migrateToEntries() has already folded in here,
+  // and `global_rows` is derived, so it is not independently editable and must
+  // not be independently clocked — two devices can no longer disagree about a
+  // total, only about the positions it is computed from.
+  const en = lsGetJson(projectId, 'entries', {});
+  Object.keys(en).forEach(k => { values[k] = en[k]; });
+
+  const cu = lsGet(projectId, 'cur');
+  values.cur = cu === null ? 0 : (parseInt(cu) || 0);
+
+  const rows = lsGetJson(projectId, 'chartRows', null);
+  if (rows) {
+    Object.keys(rows).forEach(pid => { values[chartRowKey(pid)] = rows[pid] | 0; });
+  } else {
+    // Progress saved before charts became per-phase. migrateAddClocks() already
+    // wrote a cr:<phaseId> clock for it; skipping the value here would push a
+    // clock with nothing behind it, which the merge treats as malformed and
+    // ignores — so the row someone knitted would never leave this device.
+    const legacy = lsGet(projectId, 'chartRow');
+    const phaseId = legacy !== null && legacyChartPhaseId(projectId);
+    if (phaseId) values[chartRowKey(phaseId)] = parseInt(legacy) || 1;
+  }
+
+  return { values: values, clocks: lsGetJson(projectId, 'clk', {}) };
+}
+
+// Field keys → the bucketed shape both localStorage and Postgres store.
+// Unknown prefixes are dropped rather than guessed at: a key this version does
+// not understand belongs to a newer one, and inventing a bucket for it would
+// write nonsense that later versions then have to unpick.
+function splitFields(values) {
+  const entries = {}, chart_rows = {};
+  let cur = 0;
+  Object.keys(values || {}).forEach(k => {
+    const v = values[k];
+    // ORDER MATTERS: 'rp:' has to be tested before 'r:', or every repeat
+    // position is filed as a row done-flag called "p:<id>" and both the
+    // position and the row are lost.
+    if (k.indexOf('rp:') === 0)      entries[k] = normalizeRepeatValue(v);
+    else if (k.indexOf('cr:') === 0) chart_rows[k.slice(3)] = v | 0;
+    else if (k.indexOf('n:') === 0)  entries[k] = !!v;
+    else if (k.indexOf('r:') === 0)  entries[k] = !!v;
+    else if (k === 'cur')            cur = v | 0;
+  });
+  return { entries, cur, chart_rows };
+}
+
+// A repeat position always crosses the wire as {y, z} of plain ints. Coercing
+// here is what keeps === in diffProgress() meaningful after a JSON round trip
+// through Postgres — and what stops a malformed value being merged as one.
+function normalizeRepeatValue(v) {
+  // Both halves need the |0. localStorage and jsonb can both hand back "2",
+  // and a z of "2" is not === a z of 2 — which would report a conflict on
+  // every sync for a repeat the two devices agree about exactly.
+  return { y: (v && v.y) | 0, z: ((v && v.z) | 0) || 1 };
+}
+
+// The inverse, over a row as Postgres returns it.
+function joinFields(row) {
+  const values = {};
+  const entries = (row && row.entries) || {};
+  Object.keys(entries).forEach(k => {
+    values[k] = k.indexOf('rp:') === 0 ? normalizeRepeatValue(entries[k]) : !!entries[k];
+  });
+  const rows = (row && row.chart_rows) || {};
+  Object.keys(rows).forEach(pid => { values[chartRowKey(pid)] = rows[pid] | 0; });
+  values.cur = (row && row.cur) | 0;
+  return { values: values, clocks: (row && row.clocks) || {} };
+}
+
+// Write merged progress back to a project's localStorage buckets.
+//
+// `base` is written alongside because the two only mean anything together: a
+// merge that persisted values without recording what was agreed would leave
+// every merged field looking locally-edited forever, and the next sync would
+// push it all back as if this device had made the changes.
+//
+// Returns false if the write failed, so a caller never advances a sync cursor
+// past data that is not actually on disk.
+function writeLocalProgress(projectId, values, clocks, base) {
+  const f = splitFields(values);
+  try {
+    localStorage.setItem(projKey(projectId, 'entries'), JSON.stringify(f.entries));
+    localStorage.setItem(projKey(projectId, 'cur'), f.cur);
+    localStorage.setItem(projKey(projectId, 'chartRows'), JSON.stringify(f.chart_rows));
+    // `state`/`ctrs`/`grows` are deliberately left untouched. They are the
+    // pre-conversion relics migrateToEntries() read from; blanking them here
+    // would destroy the only record of what a project looked like before,
+    // and nothing reads them any more anyway.
+    localStorage.setItem(projKey(projectId, 'clk'), JSON.stringify(clocks || {}));
+    if (base) localStorage.setItem(projKey(projectId, 'base'), JSON.stringify(base));
+  } catch(e) {
+    if (typeof showSaveError === 'function') showSaveError(e);
+    return false;
+  }
+  return true;
+}
+
+// Just the baseline, for the push path — which advances `base` without having
+// touched any value.
+function writeBase(projectId, base) {
+  try { localStorage.setItem(projKey(projectId, 'base'), JSON.stringify(base || {})); return true; }
+  catch(e) { if (typeof showSaveError === 'function') showSaveError(e); return false; }
+}
+function readBase(projectId) { return lsGetJson(projectId, 'base', {}); }
+
+// ─────────────────────────────────────────────
+// OUTBOX — which entities have unpushed changes.
+//
+// (Lives here rather than in storage.js, where the original plan put it: it is
+// read only by the flush path, alongside the clocks above, and keeping the
+// whole sync state machine in one file beats matching a file assignment made
+// before any of this existed.)
+//
+// It stores POINTERS, never bodies — an entry says "project X's progress has
+// changed", not what it changed to. Two consequences, both wanted:
+//
+//   * Coalescing is free. A second change to the same entity is already
+//     described by the entry that is there, so 60 chart-row taps leave exactly
+//     one entry of a few dozen bytes rather than 60 snapshots.
+//   * A replay always sends current data. flush() reads localStorage at send
+//     time, so an op queued twenty rows ago pushes the twentieth row, not the
+//     first. A body-carrying queue would push a stale snapshot and then have to
+//     reconcile it against the newer one behind it.
+// ─────────────────────────────────────────────
+const OUTBOX_KEY = 'pt3_outbox';
+
+function loadOutbox() {
+  try { outbox = JSON.parse(localStorage.getItem(OUTBOX_KEY) || '{}') || {}; } catch(e) { outbox = {}; }
+}
+function saveOutbox() {
+  try { localStorage.setItem(OUTBOX_KEY, JSON.stringify(outbox)); } catch(e) {}
+}
+
+// kind is 'project' (the registry record), 'progress' (that project's rows),
+// 'pdf' (a pattern's original PDF — id is the PATTERN id, not a project id,
+// since the document belongs to the pattern), or 'cpat' (a custom pattern's
+// doc, also keyed by pattern id — js/cloud/patternsync.js).
+function enqueue(kind, id) {
+  if (!id) return;
+  const key = kind + ':' + id;
+  // Already pending: there is nothing to update. `at` is deliberately the
+  // FIRST time this entity went dirty ("has had unpushed changes since…"), not
+  // the latest — which also means the common case costs one property read and
+  // no localStorage write at all, keeping the chart-row tap path cheap.
+  if (!outbox[key]) {
+    outbox[key] = { k: kind, id: id, at: syncNow() };
+    saveOutbox();
+  }
+  // Outside the guard on purpose. The write is skippable; the scheduling is
+  // not — every tap has to push the debounce back, or a 60-tap burst would
+  // flush 2.5s after the FIRST tap and then keep re-firing through the rest.
+  markDirty();
+}
+
+function dequeue(kind, id) {
+  const key = kind + ':' + id;
+  if (!outbox[key]) return;
+  delete outbox[key];
+  saveOutbox();
+}
+
+// Pending ops in send order: custom patterns, project upserts, then progress,
+// then PDFs, then deletes.
+//
+// A custom pattern goes before the projects that use it, so a device pulling
+// between the two never sees a project for a pattern it can't get yet. Its doc
+// is tens of KB, not megabytes, so it holds nothing up.
+//
+// Upserts first because a progress row references its project, so pushing
+// progress for a project the server has never seen would fail. Deletes last so
+// a queued upsert cannot resurrect a row the same flush is about to tombstone.
+//
+// PDFs sit after progress deliberately. A PDF push is megabytes over a phone
+// connection and everything behind it in the queue waits; progress is the data
+// someone would actually miss, so it goes first every time.
+function pendingOps() {
+  const ops = Object.keys(outbox).map(k => outbox[k]);
+  const rank = op => {
+    if (op.k === 'cpat') return -1;
+    if (op.k === 'project') return isDeleted(op.id) ? 3 : 0;
+    if (op.k === 'pdf') return 2;
+    return 1; // progress
+  };
+  return ops.sort((a, b) => rank(a) - rank(b) || a.at - b.at);
+}
+
+function hasPending() { return Object.keys(outbox).length > 0; }
+
+// ─────────────────────────────────────────────
+// FLUSH SCHEDULING
+//
+// Knitting is a burst of tiny edits — a row tap every few seconds for an hour.
+// Pushing each one would be a request per stitch row; waiting for a natural
+// pause would mean never pushing at all for a knitter working steadily. So:
+// a trailing debounce, bounded by a max wait.
+//
+//   debounce  each edit pushes the flush back, so a burst settles into one
+//   max wait  but a burst can only delay it so far — a steady worker still
+//             syncs every 20s, rather than only when they finally stop
+//
+// Plus immediate flushes at the moments the page might not get another chance:
+// backgrounding, unload, leaving a project, and coming back online.
+// ─────────────────────────────────────────────
+const FLUSH_DEBOUNCE_MS = 2500;
+const FLUSH_MAX_WAIT_MS = 20000;
+const FLUSH_RETRY_MS    = 60000;   // after a failed push, before trying again
+
+let flushTimer = null;
+let burstStartedAt = 0;   // 0 = no burst in progress
+let flushing = false;
+
+// ── Sync status, for the account sheet and for debugging a device that has
+// quietly stopped syncing (risk §H4: a silent catch here is unrecoverable —
+// there would be no way to find out why). ──
+const LAST_SYNC_KEY = 'pt3_last_sync';
+const SYNC_LOG_MAX = 20;
+let syncLog = [];
+let lastSyncAt = 0;
+let lastSyncError = null;
+
+function logSync(level, msg, err) {
+  syncLog.push({ at: Date.now(), level: level, msg: msg,
+                 detail: err ? (err.message || String(err)) : '' });
+  if (syncLog.length > SYNC_LOG_MAX) syncLog.shift();
+  (level === 'error' ? console.error : level === 'warn' ? console.warn : console.info)
+    ('[sync] ' + msg, err || '');
+}
+
+// ── Status, in words, for the account sheet ──
+//
+// This exists because of risk §H4: a device that silently stops syncing is
+// unrecoverable for the person using it. They have no console, no way to know
+// the difference between "everything is backed up" and "nothing has left this
+// phone since Tuesday". So both are said out loud, in the one place someone
+// looks when they wonder.
+
+function relTimeText(ms) {
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return m === 1 ? 'a minute ago' : m + ' minutes ago';
+  const h = Math.round(m / 60);
+  if (h < 24) return h === 1 ? 'an hour ago' : h + ' hours ago';
+  const d = Math.round(h / 24);
+  return d === 1 ? 'yesterday' : d + ' days ago';
+}
+
+function pendingCount() { return Object.keys(outbox).length; }
+
+function syncStatusText() {
+  if (!lastSyncAt) return 'Not backed up yet';
+  return 'Backed up ' + relTimeText(lastSyncAt);
+}
+
+function pendingText() {
+  const n = pendingCount();
+  if (!n) return null;
+  return n === 1 ? '1 change still to go up' : n + ' changes still to go up';
+}
+
+// The last failure, in language that says what it means for the knitter rather
+// than what the API returned.
+function syncErrorText() {
+  if (!lastSyncError) return null;
+  const m = (lastSyncError && lastSyncError.message) || '';
+  if (!navigator.onLine)                   return 'Offline — your work will go up when you’re back.';
+  if (/fetch|network/i.test(m))            return 'Couldn’t reach the server last time. It keeps trying.';
+  if (/jwt|token|expired/i.test(m))        return 'Your sign-in has expired. Sign out and back in to start syncing again.';
+  if (/row-level security|42501/i.test(m)) return 'The server refused the change. Nothing was lost here — please report this.';
+  return 'The last sync didn’t finish. Your work is safe on this device; it keeps trying.';
+}
+
+function loadSyncStatus() {
+  try { lastSyncAt = parseInt(localStorage.getItem(LAST_SYNC_KEY)) || 0; } catch(e) { lastSyncAt = 0; }
+}
+function noteSyncSuccess() {
+  lastSyncAt = Date.now();
+  lastSyncError = null;
+  try { localStorage.setItem(LAST_SYNC_KEY, lastSyncAt); } catch(e) {}
+}
+
+// Every timer-driven flush goes through here so the async rejection is caught
+// in exactly one place (see flushNow).
+function scheduleFlush(delay, reason) {
+  clearTimeout(flushTimer);
+  flushTimer = setTimeout(() => {
+    Promise.resolve(flush(reason)).catch(e => logSync('error', 'flush threw', e));
+  }, delay);
+}
+
+function markDirty() {
+  if (!hasPending()) return;
+  const now = Date.now();
+  if (!burstStartedAt) burstStartedAt = now;
+  // Never let the debounce push past the burst's deadline.
+  const untilDeadline = Math.max(0, (burstStartedAt + FLUSH_MAX_WAIT_MS) - now);
+  const delay = Math.min(FLUSH_DEBOUNCE_MS, untilDeadline);
+  scheduleFlush(delay, delay === untilDeadline ? 'max-wait' : 'debounce');
+}
+
+function cancelScheduledFlush() {
+  clearTimeout(flushTimer);
+  flushTimer = null;
+  burstStartedAt = 0;
+}
+
+// Skip the wait — used where the page may not survive to run the timer.
+//
+// flush() is async and nothing here awaits it. The .catch is not optional:
+// an unhandled rejection from a background sync would surface as a console
+// error with no context, in a codebase where the sync path is meant to be the
+// one place that never fails silently OR noisily-but-uselessly.
+function flushNow(reason) {
+  cancelScheduledFlush();
+  Promise.resolve(flush(reason)).catch(e => logSync('error', 'flush threw', e));
+}
+
+// ─────────────────────────────────────────────
+// PUSH
+//
+// Draining the outbox is NOT "upload what this device has". A whole-row upsert
+// would be, and it silently destroys data: the iPad pushes chart row 31, the
+// phone — which has never pulled — pushes its own complete row a minute later
+// and the iPad's 31 is gone from the cloud. Neither device ever sees a
+// conflict, because the phone's base still matches the clocks it just sent.
+//
+// So every progress push is a read-merge-write, and the write is guarded by
+// the `server_rev` it read. If someone else wrote in between, the guarded
+// update matches zero rows and the whole op starts again against the newer
+// row. That is the only thing standing between a family sharing an account and
+// losing rows to whoever pressed sync last.
+//
+// Nothing is dequeued until the server has acknowledged it. An op left in the
+// outbox is retried; an op dropped is gone.
+// ─────────────────────────────────────────────
+const MAX_PUSH_ATTEMPTS = 3;
+
+// Sync is off unless a signed-in account has actually claimed the data on this
+// device. Pushing unclaimed projects would hand one family member's knitting
+// to whoever signed in on the shared iPad first — that decision belongs to the
+// claim sheet (see js/cloud/auth.js), not to a background flush.
+function canSync() {
+  return typeof cloudState === 'function' && cloudState() === 'signed-in' &&
+         !!currentUserId() && localOwner() === currentUserId();
+}
+
+// Connectivity and auth failures mean the rest of the queue will fail too;
+// anything else is specific to one row and shouldn't stop the others.
+function isFatalSyncError(e) {
+  const m = (e && e.message) || '';
+  return /fetch|network|failed to fetch/i.test(m) || (e && (e.status === 401 || e.status === 403)) ||
+         /jwt|token/i.test(m);
+}
+
+// A re-render after the sync engine changed something under the UI.
+//
+// On the chart page a full render re-centres the chart, which would yank the
+// view out from under someone mid-row. So a background change to some OTHER
+// project — the common case, since only one is open — must not repaint the
+// screen at all.
+function renderAfterSync(touchedActiveProject) {
+  if (touchedActiveProject || view !== 'project') { resetHeaderKey(); render(); }
+}
+
+// The sync engine writes a project's localStorage keys directly. For the OPEN
+// project the in-memory globals are what save() will persist on the next tap,
+// so they have to be re-read — otherwise the very next row the knitter counts
+// writes the pre-merge state straight back over the merge.
+function reloadIfActive(projectId) {
+  if (projectId !== activeProjectId) return false;
+  loadProjectState();
+  return true;
+}
+
+function sameValues(a, b) {
+  const ka = Object.keys(a || {});
+  if (ka.length !== Object.keys(b || {}).length) return false;
+  return ka.every(k => a[k] === b[k]);
+}
+
+// Apply a remote registry row locally. Last-write-wins on updated_ms: the
+// registry holds a name and a tombstone, not per-field progress, so there is
+// nothing to merge field by field and nothing worth prompting about.
+//
+// Shared by push (which adopts a newer cloud copy instead of overwriting it)
+// and pull. Returns true if the local registry changed.
+function applyRemoteProject(row) {
+  const remoteUpdated = Number(row.updated_ms) || 0;
+  const local = projects.find(p => p.id === row.id);
+  if (local && (local.updatedAt || 0) >= remoteUpdated) return false;
+
+  const wasDeleted = !!(local && local.deletedAt);
+  const nowDeleted = !!row.deleted_ms;
+
+  const rec = local || { id: row.id };
+  rec.patternId = row.pattern_id;
+  rec.name = row.name;
+  rec.created = Number(row.created_ms) || rec.created || Date.now();
+  rec.updatedAt = remoteUpdated;
+  if (nowDeleted) rec.deletedAt = Number(row.deleted_ms); else delete rec.deletedAt;
+  if (!local) projects.push(rec);
+  saveProjects();
+  applyRemotePattern(row);
+
+  // A delete that arrived from another device has to do locally what
+  // deleteProject() does: drop the progress keys, drop any queued push for
+  // them, and get out of the project if it is the one on screen.
+  if (nowDeleted && !wasDeleted) {
+    purgeProjectData(row.id);
+    dequeue('progress', row.id);
+    if (activeProjectId === row.id) { activeProjectId = null; view = 'home'; }
+  }
+  return true;
+}
+
+// Take the structure this project is knitting from a remote row.
+//
+// This is what lets a family member open a frozen project on a device that has
+// never seen it. Without the hash it would compare against nothing and use the
+// live pattern; without the doc it would know the structure had changed but
+// have no copy of the one the ticks belong to.
+//
+// A local snapshot is never overwritten. If this device already has one it is
+// either the same structure or a decision its owner made here, and neither is
+// improved by a round trip through the server.
+function applyRemotePattern(row) {
+  if (!row.pattern_struct_hash || storedHash(row.id)) return;
+  try {
+    localStorage.setItem('pt3_proj_' + row.id + '_phash', row.pattern_struct_hash);
+    // A doc from a device still on the old code describes sections as `steps`,
+    // and this version has no renderer for those — taking it would produce a
+    // project that opens to blank sections. Fall through to the live pattern
+    // instead; the schema gate keeps that device's progress out anyway.
+    const remoteIsLegacy = row.pattern_doc && row.pattern_doc.phases &&
+      row.pattern_doc.phases.some(ph => ph && ph.steps && !ph.entries);
+    if (row.pattern_doc && row.pattern_doc.phases && !remoteIsLegacy) {
+      localStorage.setItem('pt3_proj_' + row.id + '_pattern', JSON.stringify(row.pattern_doc));
+    } else {
+      // No doc means the sending device was still on the code's version, so
+      // the pattern in this bundle IS the snapshot.
+      const live = patternById(row.pattern_id);
+      // A sized template is not a snapshot — which size this project is can
+      // only come from the doc, so with none it waits (patternColumns always
+      // sends one for a sized pattern).
+      if (live && !live.buildPhases) localStorage.setItem('pt3_proj_' + row.id + '_pattern', JSON.stringify(live));
+    }
+  } catch(e) { showSaveError(e); }
+}
+
+// → 'done' (dequeue) | 'retry' (try again) | 'drop' (nothing left to send)
+async function pushProject(id, uid) {
+  const proj = projects.find(p => p.id === id);
+  if (!proj) return 'drop';
+
+  const { data: remote, error } = await sb.from('projects')
+    .select('id,name,pattern_id,created_ms,updated_ms,deleted_ms,pattern_struct_hash,pattern_doc')
+    .eq('id', id).maybeSingle();
+  if (error) throw error;
+
+  // The cloud copy is newer, so this device's queued change is stale — take
+  // theirs rather than overwriting it. Without this check a rename queued
+  // offline last week would silently undo a rename made since.
+  if (remote && (Number(remote.updated_ms) || 0) > (proj.updatedAt || 0)) {
+    if (applyRemoteProject(remote)) renderAfterSync(id === activeProjectId);
+    return 'drop';
+  }
+
+  const { error: upErr } = await sb.from('projects').upsert(Object.assign({
+    id: proj.id, owner_id: uid, name: proj.name, pattern_id: proj.patternId,
+    created_ms: proj.created || Date.now(),
+    updated_ms: proj.updatedAt || 0,
+    deleted_ms: proj.deletedAt || null
+  }, patternColumns(proj.id)), { onConflict: 'id' });
+  if (upErr) throw upErr;
+  return 'done';
+}
+
+// The structure hash always; the frozen pattern doc only once this project has
+// diverged from the code.
+//
+// The doc is 10-40KB. Sending it with every project upsert would make a rename
+// cost more than a day's knitting, and in the normal case it is pure
+// redundancy — the receiving device has the same pattern in its own bundle and
+// can rebuild the snapshot from it. It is only irreplaceable once the code has
+// moved on, which is exactly when this starts sending it: a family member
+// opening a frozen project on a NEW device has no other way to get the
+// structure their ticks belong to.
+function patternColumns(projectId) {
+  const hash = storedHash(projectId);
+  if (!hash) return {};
+  const proj = projects.find(p => p.id === projectId);
+  const tpl = proj && patternById(proj.patternId);
+  const live = livePatternFor(proj);
+  // A sized pattern always sends its doc: the doc is the only place another
+  // device can learn which size this project is.
+  const diverged = !live || (tpl && tpl.buildPhases) || structHash(live) !== hash;
+  return {
+    pattern_struct_hash: hash,
+    pattern_doc: diverged ? frozenPattern(projectId) : null
+  };
+}
+
+async function pushProgress(id, uid) {
+  // A tombstoned project's progress keys are already purged; the delete rides
+  // on the registry row, so there is nothing here worth sending.
+  if (isDeleted(id)) return 'drop';
+
+  const local = readLocalProgress(id);
+  const base  = readBase(id);
+
+  const { data: remote, error } = await sb.from('project_progress')
+    .select('project_id,entries,cur,chart_rows,clocks,server_rev,schema_ver')
+    .eq('project_id', id).maybeSingle();
+  if (error) throw error;
+
+  // A row from a different progress namespace. An OLDER one is converted and
+  // merged normally — this push is then what writes schema_ver 2 and ends the
+  // mismatch for good. A NEWER one is still refused: this build cannot know
+  // what a later version's fields mean, and guessing would drop them silently.
+  //
+  // This early return used to fire for both, which is what deadlocked the
+  // account: the only code that writes schema_ver sits below it.
+  let remoteRow = remote;
+  if (remote && !schemaMatches(remote)) {
+    if (rowSchema(remote) > PROGRESS_SCHEMA) { noteSchemaMismatch(id, rowSchema(remote)); return 'drop'; }
+    const legacy = await fetchLegacyColumns([id]);
+    remoteRow = upgradeLegacyRow(remote, legacy[id]);
+    if (!remoteRow) { noteSchemaMismatch(id, rowSchema(remote)); return 'drop'; }
+    logSync('info', 'progress ' + id + ' upgraded from schema v' + rowSchema(remote) + ' on push');
+  }
+  clearSchemaMismatch(id);
+
+  let values = local.values, clocks = local.clocks;
+
+  if (remoteRow) {
+    const r = diffProgress(local, joinFields(remoteRow), base);
+    values = r.merged; clocks = r.mergedClocks;
+    if (r.conflicts.length) {
+      // Phase 6 fallback: keep this device's value — it is what is already on
+      // screen — but give it a FRESH clock so it wins outright everywhere on
+      // the next round. Leaving the old clock would let the two devices trade
+      // the field back and forth without either ever settling. Phase 7 asks
+      // the knitter instead of deciding for them.
+      r.conflicts.forEach(c => { clocks[c.key] = syncNow(); });
+      noteConflicts(id, r.conflicts);
+    }
+    const changed = !sameValues(local.values, values);
+    if (!writeLocalProgress(id, values, clocks, base)) return 'retry';
+    if (changed || r.conflicts.length) {
+      renderAfterSync(reloadIfActive(id));
+    }
+  }
+
+  const f = splitFields(values);
+  // `steps`/`counters`/`global_rows` are not written any more. The columns stay
+  // (they hold a v1 client's only copy), but this client has nothing to put in
+  // them — omitting them from the update leaves them exactly as they were.
+  const row = { project_id: id, owner_id: uid, entries: f.entries,
+                cur: f.cur, chart_rows: f.chart_rows,
+                clocks: clocks, schema_ver: PROGRESS_SCHEMA };
+
+  if (remote) {
+    // The guard. Zero rows means another device wrote between the select above
+    // and here, so the merge was against a row that no longer exists — start
+    // over rather than overwrite work we never saw.
+    const { data: hit, error: uErr } = await sb.from('project_progress')
+      .update(row).eq('project_id', id).eq('server_rev', remote.server_rev).select('project_id');
+    if (uErr) throw uErr;
+    if (!hit || !hit.length) { logSync('info', 'progress ' + id + ' moved under us — re-merging'); return 'retry'; }
+  } else {
+    const { error: iErr } = await sb.from('project_progress').insert(row);
+    if (iErr) {
+      if (iErr.code === '23505') return 'retry';        // raced another device's insert
+      // No project row yet — normal for progress migrated in before the outbox
+      // existed, where nothing ever queued the project itself.
+      if (iErr.code === '23503') { await pushProject(id, uid); return 'retry'; }
+      throw iErr;
+    }
+  }
+
+  // Server and device now hold the same thing, which is exactly what `base`
+  // means. Written only after the acknowledgement — advancing it earlier would
+  // mark local edits as agreed when they were never sent.
+  writeBase(id, clocks);
+  reloadIfActive(id);
+  return 'done';
+}
+
+// ─────────────────────────────────────────────
+// CONFLICTS
+//
+// A conflict is the one case the merge cannot decide: both devices changed the
+// same field to different values since they last agreed. Push and pull have
+// already applied every non-conflicting change and kept THIS device's value
+// for the clash — the safe default, since it is what is on screen.
+//
+// What is recorded here is the other device's value, which is the only thing
+// that makes the choice reversible. Without it "use the other one" has nothing
+// to restore, and the merge's decision would be final whether or not it was
+// right.
+//
+// Persisted, because a conflict can arrive while the phone is in a bag. It has
+// to still be there to answer when someone next looks.
+// ─────────────────────────────────────────────
+const CONFLICTS_KEY = 'pt3_conflicts';
+const MAX_CONFLICTS = 50;
+let pendingConflicts = [];    // [{ p: projectId, k: fieldKey, mine, theirs, at }]
+
+function loadConflicts() {
+  try { pendingConflicts = JSON.parse(localStorage.getItem(CONFLICTS_KEY) || '[]') || []; }
+  catch(e) { pendingConflicts = []; }
+}
+function saveConflicts() {
+  try { localStorage.setItem(CONFLICTS_KEY, JSON.stringify(pendingConflicts)); } catch(e) {}
+}
+
+function noteConflicts(projectId, conflicts) {
+  conflicts.forEach(c => {
+    const i = pendingConflicts.findIndex(x => x.p === projectId && x.k === c.key);
+    // Replace rather than append: a field that clashes twice is still one
+    // question, and the newer remote value is the one worth offering.
+    const rec = { p: projectId, k: c.key, mine: c.local, theirs: c.remote, at: Date.now() };
+    if (i >= 0) pendingConflicts[i] = rec; else pendingConflicts.push(rec);
+  });
+  while (pendingConflicts.length > MAX_CONFLICTS) pendingConflicts.shift();
+  saveConflicts();
+  logSync('warn', conflicts.length + ' field(s) changed on both devices for ' + projectId +
+    ' — keeping this device\'s values until reviewed');
+  showConflictBanner();
+}
+
+// Entries that are still a real question. Prunes the ones that answered
+// themselves: the project was deleted, the field no longer exists, or a later
+// sync settled on the other device's value anyway.
+function liveConflicts() {
+  const kept = pendingConflicts.filter(c => {
+    if (isDeleted(c.p)) return false;
+    const v = readLocalProgress(c.p).values;
+    if (!Object.prototype.hasOwnProperty.call(v, c.k)) return false;
+    return v[c.k] !== c.theirs;
+  });
+  if (kept.length !== pendingConflicts.length) { pendingConflicts = kept; saveConflicts(); }
+  return kept;
+}
+
+// Apply one answer. `useTheirs` writes the other device's value; otherwise
+// this device's value simply stands, since it is already what is stored.
+//
+// Either way the field gets a FRESH clock, so the answer wins outright on the
+// next push instead of being re-litigated the next time the two devices meet.
+function resolveConflict(projectId, key, useTheirs) {
+  const rec = pendingConflicts.find(c => c.p === projectId && c.k === key);
+  pendingConflicts = pendingConflicts.filter(c => !(c.p === projectId && c.k === key));
+  saveConflicts();
+  // Before the early return: the entry is gone either way, so the count on the
+  // banner has to move with it or it keeps advertising questions that have
+  // already been answered.
+  showConflictBanner();
+  if (!rec) return;
+
+  const local = readLocalProgress(projectId);
+  const values = Object.assign({}, local.values);
+  const clocks = Object.assign({}, local.clocks);
+  if (useTheirs) values[key] = rec.theirs;
+  clocks[key] = syncNow();
+
+  if (!writeLocalProgress(projectId, values, clocks, readBase(projectId))) return;
+  enqueue('progress', projectId);
+  const wasActive = reloadIfActive(projectId);
+  renderAfterSync(wasActive);
+}
+
+function resolveAll(useTheirs) {
+  liveConflicts().slice().forEach(c => resolveConflict(c.p, c.k, useTheirs));
+}
+
+// ── Naming the thing that clashed ──
+//
+// "cr:yoke-chart: 31 vs 23" is not a question anyone can answer. The label has
+// to come from the pattern, so the row reads "Yoke chart — chart row" with the
+// numbers beside it. The pattern is looked up per project, not from the active
+// one: a conflict can belong to a project that isn't open.
+function plainText(s, max) {
+  const txt = String(s || '').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+  return txt.length > (max || 44) ? txt.slice(0, (max || 44) - 1) + '…' : txt;
+}
+
+function conflictLabel(c) {
+  const proj = projects.find(p => p.id === c.p);
+  const pat = livePatternFor(proj);
+  const phases = (pat && pat.phases) || [];
+  // `|| []` because a converted section has `entries`, not `steps`. Conflict
+  // labelling only ever resolves s:/c: keys, which converted sections do not
+  // produce, so there is nothing for it to find there — but it must not throw
+  // while walking past one.
+  const entries = phases.reduce((a, ph) => a.concat(ph.entries || []), []);
+  const findEntry = id => entries.find(x => x.id === id);
+  const num = v => String(v);
+
+  if (c.k === 'cur') {
+    return { field: 'Section', fmt: v => (phases[v] && phases[v].name) || ('Section ' + ((v | 0) + 1)) };
+  }
+  if (c.k.indexOf('cr:') === 0) {
+    const ph = phases.find(x => x.id === c.k.slice(3));
+    return { field: (ph ? plainText(ph.name, 28) : 'Chart') + ' — chart row', fmt: num };
+  }
+  // Order matters here too: 'rp:' before 'r:'.
+  if (c.k.indexOf('rp:') === 0) {
+    const e = findEntry(c.k.slice(3));
+    // A position needs saying in the terms the knitter sees on the dock —
+    // "pass 3 of 4, row 2" — not as a {y,z} pair nobody could choose between.
+    const R = e ? ((e.rows || []).length || 1) : 1;
+    const T = e ? (e.times | 0) : 0;
+    return {
+      field: (e && plainText(e.text)) || 'Repeat',
+      fmt: v => {
+        const y = (v && v.y) | 0, z = (v && v.z) || 1;
+        return y >= T && T ? 'Finished (' + (T * R) + ' rows)'
+                           : 'Pass ' + (y + 1) + ' of ' + T + ', row ' + z + ' of ' + R;
+      }
+    };
+  }
+  if (c.k.indexOf('n:') === 0 || c.k.indexOf('r:') === 0) {
+    const e = findEntry(c.k.slice(c.k.indexOf(':') + 1));
+    return { field: (e && plainText(e.text)) || (c.k.indexOf('n:') === 0 ? 'Note' : 'Row'),
+             fmt: v => (v ? 'Done' : 'Not done') };
+  }
+  return { field: c.k, fmt: num };
+}
+
+// ─────────────────────────────────────────────
+// PROGRESS SCHEMA GATE
+//
+// The entries model renamed every progress key. splitFields() drops prefixes
+// it does not recognise — sensible when the unknown key is from a NEWER
+// client, catastrophic when two live versions disagree about all of them at
+// once: each would file the other's whole payload under "not mine" and write
+// its own view over the top, with no conflict raised and nothing on screen to
+// say a row had been lost.
+//
+// So every row carries the namespace that wrote it, and a client refuses to
+// merge one it does not share. Refusing is the point: the failure becomes a
+// banner asking the user to update their other device, instead of progress
+// quietly going missing.
+// ─────────────────────────────────────────────
+const PROGRESS_SCHEMA = 2;
+
+function schemaMatches(row) { return ((row && row.schema_ver) | 0) === PROGRESS_SCHEMA; }
+function rowSchema(row) { return (row && row.schema_ver) | 0; }
+
+// ─────────────────────────────────────────────
+// UPGRADING A v1 ROW — the deadlock fix
+//
+// The gate below used to refuse a v1 row in BOTH directions: pull skipped it
+// and push returned 'drop' before the line that writes schema_ver. Since
+// nothing else writes that column, a v1 row could never become a v2 row — not
+// by waiting, and not by "opening Stitch Ease on your other device", because
+// that device, once updated, refuses for exactly the same reason. Every
+// project on the account stopped syncing and the banner saying so could not be
+// dismissed or acted on. Four rows sat like that from 13 August.
+//
+// Refusing to MERGE a v1 row was right: its fields are in the old namespace, so
+// reading them through v2 prefixes would silently drop everything it holds.
+// The mistake was treating "cannot merge this" as "cannot do anything with
+// this". A v1 row is not foreign data — it is the same progress in the shape
+// this app used last week, and seedEntryProgress() is the exact, already-proven
+// mapping out of it. migrateToEntries() converted every local project with it.
+//
+// So: convert on read, then merge normally. The upgraded row goes through
+// diffProgress() like any other, both devices' work survives, real clashes
+// raise the usual conflict sheet, and the next push writes schema_ver 2 —
+// which is what makes it a one-time event rather than a permanent state.
+//
+// `steps`/`counters` are NOT cleared server-side. They are a v1 client's only
+// copy, seedEntryProgress() only ever reads them, and dropping them is a
+// separate decision for when no v1 client can exist.
+// ─────────────────────────────────────────────
+
+// The pattern a project actually knits — the frozen snapshot when it has
+// diverged, the live entry otherwise. The wrong one here would map ticks onto
+// the wrong entries, which is the whole failure the freeze mechanism exists to
+// prevent, so this returns null rather than guessing.
+function patternForUpgrade(projectId) {
+  const proj = projects.find(p => p.id === projectId);
+  if (!proj) return null;
+  const resolved = patternForProject(proj);
+  return (resolved && resolved.pattern) || null;
+}
+
+// v1 clock keys → v2 clock keys, through the same relationships
+// seedEntryProgress() uses for the values. A clock has to travel with the field
+// it describes: leaving one behind makes a real edit look like it never
+// happened, and the merge would then treat the other device's older value as
+// the newer one.
+//
+//   note / row   s:<id>                          → n:<id> / r:<id>
+//   repeat       c:<id> and s:<id>__b<i>          → rp:<id>
+//   cur, cr:<phaseId>                             unchanged, same key in both
+//
+// `global_rows` is deliberately dropped: it is derived in v2, carries no value
+// through readLocalProgress(), and diffProgress() ignores a clock with no value
+// anyway. Carrying it would be a timestamp asserting an edit to a field that no
+// longer exists.
+function upgradeLegacyClocks(v1, pattern) {
+  const out = {};
+  Object.keys(v1 || {}).forEach(k => {
+    if (k === 'cur' || k.indexOf('cr:') === 0) out[k] = v1[k];
+  });
+  ((pattern && pattern.phases) || []).forEach(ph => (ph.entries || []).forEach(e => {
+    if (e.kind === 'repeat') {
+      // A repeat's position was fed by the counter AND the bullet ticks, and
+      // either could have been the last thing touched. The newest of them is
+      // when this position last moved.
+      let t = (v1 || {})['c:' + e.id] || 0;
+      for (let i = 0; i < repeatLength(e); i++) {
+        t = Math.max(t, (v1 || {})['s:' + e.id + '__b' + i] || 0);
+      }
+      if (t) out[repeatKey(e.id)] = t;
+    } else {
+      const t = (v1 || {})['s:' + e.id] || 0;
+      if (t) out[e.kind === 'note' ? noteKey(e.id) : rowKey(e.id)] = t;
+    }
+  }));
+  return out;
+}
+
+// A v1 row (plus its legacy columns) rewritten in the v2 shape, or null if this
+// device cannot do it — which means the pattern is missing from this build, and
+// skipping is still correct.
+function upgradeLegacyRow(row, legacy) {
+  const pattern = patternForUpgrade(row.project_id);
+  if (!pattern) return null;
+  const entries = seedEntryProgress({}, (legacy && legacy.steps) || {},
+                                        (legacy && legacy.counters) || {}, pattern.phases);
+  return {
+    project_id: row.project_id,
+    entries: entries,
+    cur: row.cur | 0,
+    chart_rows: row.chart_rows || {},
+    clocks: upgradeLegacyClocks(row.clocks, pattern),
+    server_rev: row.server_rev,
+    schema_ver: PROGRESS_SCHEMA
+  };
+}
+
+// The legacy columns for specific projects, fetched only when a v1 row is
+// actually seen. Adding them to the ordinary select would spend a few KB per
+// project on every pull forever, to carry two columns that are dead the moment
+// the upgrade lands.
+async function fetchLegacyColumns(projectIds) {
+  const byId = {};
+  if (!projectIds.length) return byId;
+  const { data, error } = await sb.from('project_progress')
+    .select('project_id,steps,counters').in('project_id', projectIds);
+  if (error) throw error;
+  (data || []).forEach(r => { byId[r.project_id] = r; });
+  return byId;
+}
+
+let schemaMismatches = {};
+
+function noteSchemaMismatch(projectId, theirVer) {
+  const known = schemaMismatches[projectId];
+  schemaMismatches[projectId] = theirVer;
+  if (known !== theirVer) {
+    logSync('info', 'progress ' + projectId + ' is schema v' + theirVer +
+                    ', this device speaks v' + PROGRESS_SCHEMA + ' — not merging');
+  }
+  showSchemaBanner();
+}
+
+function clearSchemaMismatch(projectId) {
+  if (projectId in schemaMismatches) {
+    delete schemaMismatches[projectId];
+    if (!Object.keys(schemaMismatches).length) hideSchemaBanner();
+  }
+}
+
+// Only the two states this device genuinely cannot resolve on its own reach
+// here now. An older row is no longer one of them: it gets converted on sight,
+// so a mismatch that used to be permanent is a transient nobody needs telling
+// about — and the old banner for it could not be dismissed OR acted on, since
+// its advice ("open it on your other device") was impossible by construction.
+//
+// A banner is only worth raising when there is something the reader can do.
+// Newer-than-this-build: reload, which genuinely does fix it. Pattern missing:
+// nothing to do here, but silence would be worse — that project is not syncing
+// and the reason is not otherwise visible anywhere.
+function schemaBannerText() {
+  const vers = Object.keys(schemaMismatches).map(k => schemaMismatches[k]);
+  const n = vers.length;
+  const theirs = Math.max.apply(null, vers.concat(0));
+  const what = n === 1 ? 'A project is' : n + ' projects are';
+  return theirs > PROGRESS_SCHEMA
+    ? what + ' saved by a newer version of Stitch Ease. Reload this device to catch up.'
+    : what + ' not syncing — the pattern isn’t in this version of the app. Your progress here is safe.';
+}
+
+function showSchemaBanner() {
+  if (!Object.keys(schemaMismatches).length) return;
+  let b = document.getElementById('schema-banner');
+  if (!b) {
+    b = document.createElement('div');
+    b.id = 'schema-banner';
+    b.className = 'sync-banner warn';
+    bannerStack().appendChild(b);
+  }
+  b.textContent = schemaBannerText();
+}
+
+function hideSchemaBanner() {
+  const b = document.getElementById('schema-banner');
+  if (b) b.remove();
+  pruneBannerStack();
+}
+
+// ── The sheet ──
+//
+// Only the clashes appear. Everything else merged already and saying so would
+// bury the two or three rows that actually need a person.
+function openConflictSheet() {
+  const list = liveConflicts();
+  if (!list.length) { closeSheet(); hideConflictBanner(); return; }
+
+  // Grouped by project, because "chart row 31 or 23" means nothing until you
+  // know which sweater.
+  const byProject = {};
+  list.forEach(c => { (byProject[c.p] = byProject[c.p] || []).push(c); });
+
+  const groups = Object.keys(byProject).map(pid => {
+    const proj = projects.find(p => p.id === pid);
+    const rows = byProject[pid].map(c => {
+      const L = conflictLabel(c);
+      return `<div class="cfl-row">
+          <div class="cfl-field">${escapeHtml(L.field)}</div>
+          <div class="cfl-opts">
+            <button class="cfl-opt" data-p="${escapeHtml(c.p)}" data-k="${escapeHtml(c.k)}" data-t="0">
+              <span class="cfl-who">This device</span><span class="cfl-val">${escapeHtml(L.fmt(c.mine))}</span>
+            </button>
+            <button class="cfl-opt" data-p="${escapeHtml(c.p)}" data-k="${escapeHtml(c.k)}" data-t="1">
+              <span class="cfl-who">Other device</span><span class="cfl-val">${escapeHtml(L.fmt(c.theirs))}</span>
+            </button>
+          </div>
+        </div>`;
+    }).join('');
+    return `<div class="cfl-group"><div class="cfl-proj">${escapeHtml((proj && proj.name) || 'Project')}</div>${rows}</div>`;
+  }).join('');
+
+  openSheet('Two devices disagree',
+    `<p class="sheet-msg">These were changed in both places. Everything else has already been merged.</p>
+     ${groups}
+     <div class="sheet-actions">
+       <button class="btn" id="cfl-mine">Keep this device</button>
+       <button class="btn" id="cfl-theirs">Use the other</button>
+     </div>
+     <p class="msg msg--note">Closing this keeps what's on this device — nothing is lost either way.</p>`,
+    {
+      // Dismissing is an answer, not a deferral: this device's values are
+      // already stored, so leaving them is the only outcome that changes
+      // nothing. Re-asking on every sync would be nagging about a question
+      // that has, in effect, been answered.
+      onDismiss: () => { resolveAll(false); hideConflictBanner(); },
+      onOpen: el => {
+        el.querySelectorAll('.cfl-opt').forEach(b => {
+          b.onclick = () => {
+            resolveConflict(b.dataset.p, b.dataset.k, b.dataset.t === '1');
+            openConflictSheet();       // redraw with that row gone
+          };
+        });
+        el.querySelector('#cfl-mine').onclick   = () => { resolveAll(false); closeSheet(); hideConflictBanner(); };
+        el.querySelector('#cfl-theirs').onclick = () => { resolveAll(true);  closeSheet(); hideConflictBanner(); };
+      }
+    });
+}
+
+// ── The prompt ──
+//
+// A banner, not an auto-opening sheet. The plan called for opening the sheet
+// as soon as conflicts exist, but a sync can land mid-row on the chart page,
+// and a modal appearing over the chart while someone is counting is exactly
+// the "blocking knitting" the plan forbids two lines later. The banner is
+// persistent — it does not go away until the question is answered — so nothing
+// is missed, and it opens the same sheet on tap.
+function showConflictBanner() {
+  if (!liveConflicts().length) return hideConflictBanner();
+  let b = document.getElementById('conflict-banner');
+  if (!b) {
+    b = document.createElement('div');
+    b.id = 'conflict-banner';
+    bannerStack().appendChild(b);
+  }
+  const n = liveConflicts().length;
+  b.innerHTML = `<span>${n === 1 ? 'One thing was changed in two places' :
+                          n + ' things were changed in two places'}</span>` +
+                `<button onclick="openConflictSheet()">Review</button>`;
+}
+
+function hideConflictBanner() {
+  const b = document.getElementById('conflict-banner');
+  if (b) { b.remove(); pruneBannerStack(); }
+}
+
+async function flush(reason) {
+  // Re-arm rather than drop. The edits that triggered this call are still in
+  // the outbox, but the in-flight flush has already read past them — and
+  // cancelling the timer below without rescheduling would strand them until
+  // the next tap.
+  if (flushing) {
+    scheduleFlush(FLUSH_DEBOUNCE_MS, 'after-inflight');
+    return;
+  }
+  cancelScheduledFlush();
+  if (!hasPending()) return;
+  if (!navigator.onLine) {
+    // Not an error — the `online` listener below picks it up again.
+    console.info('[sync] offline, deferring flush (' + reason + '):', pendingOps().length, 'op(s)');
+    return;
+  }
+  if (!canSync()) return;   // signed out, or the data here isn't this account's
+
+  flushing = true;
+  const uid = currentUserId();
+  const ops = pendingOps();
+  let failed = 0;
+  console.info('[sync] flush (' + reason + '):', ops.map(o => o.k + ':' + o.id).join(', '));
+
+  try {
+    for (const op of ops) {
+      try {
+        let outcome = 'retry';
+        for (let attempt = 0; attempt < MAX_PUSH_ATTEMPTS && outcome === 'retry'; attempt++) {
+          outcome = op.k === 'project' ? await pushProject(op.id, uid)
+                  : op.k === 'pdf'     ? await pushPdf(op.id, uid)
+                  : op.k === 'cpat'    ? await pushCustomPattern(op.id, uid)
+                                       : await pushProgress(op.id, uid);
+        }
+        if (outcome === 'retry') {
+          // Left queued on purpose — contention that outlasts three attempts
+          // is better retried later than resolved by giving up on the data.
+          failed++;
+          logSync('warn', 'gave up on ' + op.k + ':' + op.id + ' for now — still queued');
+          continue;
+        }
+        dequeue(op.k, op.id);
+      } catch (e) {
+        failed++;
+        lastSyncError = e;
+        logSync('error', 'push failed for ' + op.k + ':' + op.id, e);
+        if (isFatalSyncError(e)) break;   // the rest will fail the same way
+      }
+    }
+    if (!failed) noteSyncSuccess();
+  } finally {
+    flushing = false;
+  }
+
+  if (!hasPending()) return;
+  if (failed) {
+    // Something is still queued and the last attempt didn't work. Without a
+    // retry the queue would sit untouched until the knitter happened to make
+    // another edit — a transient blip would look like sync had simply stopped.
+    scheduleFlush(FLUSH_RETRY_MS, 'retry');
+  } else {
+    markDirty();   // edits made while the flush was in flight
+  }
+}
+
+// ─────────────────────────────────────────────
+// PULL
+//
+// The cursor is per account, not per device. A shared iPad where two family
+// members sign in and out would otherwise carry one person's cursor into the
+// other's first pull and skip every row written before it — an empty library
+// on a device that has the data sitting right there in the cloud.
+//
+// Two cursors, because the two tables number their changes differently:
+// progress has a server_rev sequence (a strict ordering, so `>` is safe),
+// projects only has a timestamp. Rows written in the same transaction share a
+// timestamp, so `>` there could step over one — `>=` re-fetches the boundary
+// row instead, which costs a few hundred bytes and cannot lose anything, since
+// applying a remote row is idempotent.
+// ─────────────────────────────────────────────
+const CURSOR_KEY = 'pt3_sync_cursor';
+let syncCursor = { uid: null, rev: 0, projTs: null };
+let pulling = false;
+
+function loadCursor() {
+  try { syncCursor = JSON.parse(localStorage.getItem(CURSOR_KEY) || 'null') || syncCursor; } catch(e) {}
+}
+function saveCursor() {
+  try { localStorage.setItem(CURSOR_KEY, JSON.stringify(syncCursor)); } catch(e) {}
+}
+function cursorFor(uid) {
+  if (syncCursor.uid !== uid) syncCursor = { uid: uid, rev: 0, projTs: null };
+  return syncCursor;
+}
+
+// What `base` should become after a merge: the clock of every field where the
+// merged answer is what the server already holds — which is exactly what "we
+// agreed" means, and the only definition that gets every case right.
+//
+//   adopted from remote      merged === remote  → agreed, base moves
+//   both changed, equal      merged === remote  → agreed, base moves
+//   local edit, remote stale merged !== remote  → still ours to push
+//   conflict, kept local     merged !== remote  → still ours to push
+//
+// Getting this wrong is invisible until much later: a base advanced too far
+// marks a local edit as already synced and it is never pushed at all.
+function agreedBase(base, merged, mergedClocks, remoteValues) {
+  const next = Object.assign({}, base);
+  Object.keys(merged).forEach(k => {
+    if (Object.prototype.hasOwnProperty.call(remoteValues, k) && remoteValues[k] === merged[k]) {
+      next[k] = mergedClocks[k] || 0;
+    }
+  });
+  return next;
+}
+
+// Merge one remote progress row into local storage. Returns true if anything
+// on this device changed.
+function mergeRemoteProgress(row) {
+  const id = row.project_id;
+  // Deleted here: the progress keys are already purged and the tombstone is on
+  // its way up. Re-materialising them would be the resurrection bug tombstones
+  // exist to prevent.
+  if (isDeleted(id)) return false;
+
+  const local = readLocalProgress(id);
+  const base = readBase(id);
+  const remote = joinFields(row);
+  const r = diffProgress(local, remote, base);
+
+  if (r.conflicts.length) {
+    // Same Phase 6 fallback as the push path: keep what is on screen, with a
+    // fresh clock so it settles rather than ping-ponging. Phase 7 asks.
+    r.conflicts.forEach(c => { r.mergedClocks[c.key] = syncNow(); });
+    noteConflicts(id, r.conflicts);
+  }
+
+  const nextBase = agreedBase(base, r.merged, r.mergedClocks, remote.values);
+  const changed = !sameValues(local.values, r.merged);
+  if (!changed && !r.conflicts.length && sameValues(base, nextBase)) return false;
+
+  if (!writeLocalProgress(id, r.merged, r.mergedClocks, nextBase)) return false;
+
+  // Anything the server does not have yet — a local edit it never saw, or a
+  // conflict we just resolved in this device's favour — has to go back up, or
+  // the two would sit disagreeing until the knitter happened to touch the
+  // field again.
+  if (Object.keys(r.mergedClocks).some(k => (r.mergedClocks[k] || 0) > (nextBase[k] || 0))) {
+    enqueue('progress', id);
+  }
+  reloadIfActive(id);
+  return changed || r.conflicts.length > 0;
+}
+
+async function pull(reason) {
+  if (pulling) return;
+  if (!navigator.onLine) return;
+  if (!canSync()) return;
+
+  pulling = true;
+  lastPullAt = Date.now();
+  // NOT named `cur` — that is the global current-phase index, and shadowing it
+  // inside the one function that also triggers a render is a trap.
+  const cursor = cursorFor(currentUserId());
+  let touchedActive = false, changed = false;
+
+  try {
+    // Custom patterns before anything else, in their own try: a project from
+    // an imported pattern opens only once the pattern is here, and
+    // applyRemotePattern() can only freeze a real snapshot if it already is.
+    // A failure here must not cost the progress pull, so it is only logged.
+    try {
+      if (await pullCustomPatterns()) changed = true;
+    } catch (e) {
+      logSync('warn', 'custom pattern pull failed — progress sync unaffected', e);
+    }
+
+    // Projects next: a progress row for a project this device has never heard
+    // of needs the registry record to exist before it can be attributed.
+    let q = sb.from('projects')
+      .select('id,name,pattern_id,created_ms,updated_ms,deleted_ms,server_updated_at,pattern_struct_hash,pattern_doc');
+    if (cursor.projTs) q = q.gte('server_updated_at', cursor.projTs);
+    const { data: remoteProjects, error: pErr } = await q;
+    if (pErr) throw pErr;
+
+    (remoteProjects || []).forEach(row => {
+      // Checked BEFORE applying: a remote tombstone for the open project
+      // clears activeProjectId, so asking afterwards always says "no".
+      const wasActive = row.id === activeProjectId;
+      if (applyRemoteProject(row)) { changed = true; if (wasActive) touchedActive = true; }
+      if (!cursor.projTs || row.server_updated_at > cursor.projTs) cursor.projTs = row.server_updated_at;
+    });
+
+    const { data: remoteProgress, error: gErr } = await sb.from('project_progress')
+      .select('project_id,entries,cur,chart_rows,clocks,server_rev,schema_ver')
+      .gt('server_rev', cursor.rev);
+    if (gErr) throw gErr;
+
+    // A row from a different progress namespace is skipped, not merged. The
+    // cursor must then stay BELOW it: the pull asks for server_rev > cursor,
+    // so letting a later row carry the cursor past a skipped one would strand
+    // that project forever, which is exactly the silent loss the gate exists
+    // to prevent. Held one short of the lowest skipped rev instead, so it is
+    // re-examined on every pull and lands the moment the other device updates.
+    // v1 rows are converted, not skipped (see upgradeLegacyRow). Their legacy
+    // columns are fetched in ONE extra query for the whole batch, before the
+    // merge loop, so the loop stays synchronous and a row cannot be half-merged
+    // while awaiting. Costs nothing once no v1 rows remain, which is the point.
+    let legacyById = {};
+    const legacyIds = (remoteProgress || [])
+      .filter(r => rowSchema(r) < PROGRESS_SCHEMA).map(r => r.project_id);
+    if (legacyIds.length) {
+      try {
+        legacyById = await fetchLegacyColumns(legacyIds);
+      } catch (e) {
+        // Leaving legacyById empty makes every upgrade below fail its own way
+        // and fall through to the skip path — the old behaviour, which is safe.
+        logSync('warn', 'could not read legacy progress columns — skipping those rows this pull', e);
+      }
+    }
+
+    let minSkipped = Infinity;
+    (remoteProgress || []).forEach(row => {
+      const rev = Number(row.server_rev) || 0;
+      let use = row;
+
+      if (!schemaMatches(row)) {
+        // Newer than this build: genuinely nothing to do but reload.
+        // Older: convert it, unless the pattern is missing from this build.
+        const upgraded = rowSchema(row) < PROGRESS_SCHEMA
+          ? upgradeLegacyRow(row, legacyById[row.project_id]) : null;
+        if (!upgraded) {
+          noteSchemaMismatch(row.project_id, rowSchema(row));
+          if (rev < minSkipped) minSkipped = rev;
+          return;
+        }
+        logSync('info', 'progress ' + row.project_id + ' upgraded from schema v' +
+                        rowSchema(row) + ' on read');
+        use = upgraded;
+        // The upgraded row is only in memory. Pushing is what makes it stick,
+        // and until it does, every pull redoes this — harmless, but the point
+        // is to stop doing it.
+        enqueue('progress', row.project_id);
+      }
+
+      clearSchemaMismatch(row.project_id);
+      if (mergeRemoteProgress(use)) {
+        changed = true;
+        if (row.project_id === activeProjectId) touchedActive = true;
+      }
+      if (rev > cursor.rev) cursor.rev = rev;
+    });
+    if (minSkipped !== Infinity) cursor.rev = Math.min(cursor.rev, minSkipped - 1);
+
+    // PDF metadata, in its own try. It is the least important thing in this
+    // function and must never be able to cost the pull its cursor save or its
+    // success stamp — a storage hiccup would otherwise look like sync failing.
+    try {
+      if (await pullPdfs(currentUserId())) changed = true;
+    } catch (e) {
+      logSync('warn', 'pdf metadata pull failed — progress sync unaffected', e);
+    }
+
+    saveCursor();
+    noteSyncSuccess();
+    if (changed) {
+      console.info('[sync] pull (' + reason + '): applied ' + (remoteProjects || []).length +
+                   ' project row(s), ' + (remoteProgress || []).length + ' progress row(s)');
+      renderAfterSync(touchedActive);
+    }
+    // A merge that left something for us to send (see mergeRemoteProgress).
+    if (hasPending()) markDirty();
+  } catch (e) {
+    lastSyncError = e;
+    logSync('error', 'pull failed (' + reason + ')', e);
+  } finally {
+    pulling = false;
+  }
+}
+
+// ─────────────────────────────────────────────
+// THREE-WAY MERGE
+//
+// Pure. No I/O, no globals — everything comes in as arguments, which is what
+// makes it testable without a backend (see sync.selftest.js).
+//
+// Detecting a real conflict needs a BASELINE: what both sides agreed on at the
+// last successful sync. With only two versions you cannot tell "the other side
+// is simply stale" from "the other side diverged", so you either prompt
+// constantly or lose data silently. With a baseline, per field:
+//
+//   local changed?  remote changed?  →  action
+//   no              no                  nothing
+//   yes             no                  keep local
+//   no              yes                 take remote
+//   yes             yes, values differ  CONFLICT — ask
+//   yes             yes, values equal   agreed independently, no prompt
+//
+// where "changed" means clock > baseClock.
+//
+// This is what makes the common case invisible. Tick three Materials steps on
+// the phone while the iPad sits on chart row 31: those are different fields, so
+// both survive untouched and nobody is asked anything.
+//
+//   local / remote  { values: {fieldKey: value}, clocks: {fieldKey: epoch_ms} }
+//   base            {fieldKey: epoch_ms}
+//   → { merged, mergedClocks, conflicts }
+//
+// Conflicted fields are left at the LOCAL value in `merged`. That is the safe
+// default — it is what is already on screen — and it means a caller that
+// ignores `conflicts` still behaves sanely rather than silently adopting the
+// other device's value.
+// ─────────────────────────────────────────────
+// Field values used to be booleans and ints, so `===` was the whole story. A
+// repeat's position is an OBJECT, and two objects are never `===` — comparing
+// them that way would report a conflict on every single sync for every repeat
+// both devices had touched, even when they agreed exactly.
+function sameFieldValue(a, b) {
+  if (a === b) return true;
+  if (a && b && typeof a === 'object' && typeof b === 'object') {
+    return (a.y | 0) === (b.y | 0) && (a.z | 0) === (b.z | 0);
+  }
+  return false;
+}
+
+function diffProgress(local, remote, base) {
+  const lv = (local && local.values) || {}, lc = (local && local.clocks) || {};
+  const rv = (remote && remote.values) || {}, rc = (remote && remote.clocks) || {};
+  const bc = base || {};
+
+  const merged = Object.assign({}, lv);
+  const mergedClocks = Object.assign({}, lc);
+  const conflicts = [];
+
+  const keys = new Set(
+    Object.keys(lv).concat(Object.keys(rv), Object.keys(lc), Object.keys(rc))
+  );
+
+  keys.forEach(k => {
+    const lClock = lc[k] || 0, rClock = rc[k] || 0, bClock = bc[k] || 0;
+    const localChanged  = lClock > bClock;
+    const remoteChanged = rClock > bClock;
+
+    if (!remoteChanged) return;          // nothing to take; local already stands
+    // A clock with no value behind it is malformed — taking it would delete a
+    // field on the strength of a timestamp alone.
+    if (!Object.prototype.hasOwnProperty.call(rv, k)) return;
+
+    if (!localChanged) {                 // only the other side moved
+      merged[k] = rv[k];
+      mergedClocks[k] = rClock;
+      return;
+    }
+    if (sameFieldValue(lv[k], rv[k])) {  // both moved, and agreed
+      mergedClocks[k] = Math.max(lClock, rClock);
+      return;
+    }
+    conflicts.push({ key: k, local: lv[k], remote: rv[k], localClock: lClock, remoteClock: rClock });
+  });
+
+  return { merged, mergedClocks, conflicts };
+}
+
+// ─────────────────────────────────────────────
+// WHEN TO SYNC
+//
+// Polling, not Realtime. The two-device case here is "phone in hand, iPad on
+// the table" — one of them is always backgrounded, so pulling on focus covers
+// it without a standing websocket that has to be nursed through every network
+// transition a phone goes through in a day.
+//
+// The interval runs ONLY while the page is visible. This is a PWA that sits
+// open for weeks; a timer that keeps firing while it is buried would be a
+// request a minute, forever, for a knitter who isn't knitting.
+// ─────────────────────────────────────────────
+const PULL_INTERVAL_MS = 60000;
+const PULL_STALE_MS    = 30000;   // on refocus, don't re-pull if we just did
+let pullTimer = null;
+let lastPullAt = 0;
+let syncedForUid = null;
+
+function startSyncPolling() {
+  stopSyncPolling();
+  if (document.visibilityState !== 'visible') return;
+  pullTimer = setInterval(() => pull('interval'), PULL_INTERVAL_MS);
+}
+function stopSyncPolling() { clearInterval(pullTimer); pullTimer = null; }
+
+// Pull, and send anything already queued. Used wherever sync should catch up
+// right now: signing in, claiming this device's projects, coming back online.
+function kickSync(reason) {
+  pull(reason);
+  flushNow(reason);   // no-op when the outbox is empty
+}
+
+// Called from the auth state listener. That fires on token refreshes too, so
+// the expensive half only runs when the account actually changed.
+function syncOnSignedIn() {
+  const uid = currentUserId();
+  if (!uid) return;
+  startSyncPolling();
+  if (syncedForUid === uid) return;
+  syncedForUid = uid;
+  learnServerSkew();
+  kickSync('signed-in');
+}
+
+function syncOnSignedOut() {
+  syncedForUid = null;
+  stopSyncPolling();
+  // The outbox is deliberately left alone. Signing out is not a decision to
+  // discard work that hasn't reached the cloud yet.
+}
+
+window.addEventListener('online', () => kickSync('online'));
+
+// Backgrounding is the last reliable moment on mobile — a phone may freeze or
+// kill the tab without ever firing anything else.
+//
+// The flush is async, so on `pagehide` it will usually not finish: the page is
+// gone before the request resolves. That is fine and is why the outbox is
+// persisted — the next open pushes it. What these listeners buy is the common
+// case where the tab is merely backgrounded and does survive.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    flushNow('hidden');
+    stopSyncPolling();
+    return;
+  }
+  startSyncPolling();
+  // Coming back to a tab that was hidden for a minute is the moment the other
+  // device's work should appear. Coming back to one hidden for three seconds
+  // is not worth a request.
+  if (Date.now() - lastPullAt > PULL_STALE_MS) pull('visible');
+});
+window.addEventListener('pagehide', () => flushNow('pagehide'));

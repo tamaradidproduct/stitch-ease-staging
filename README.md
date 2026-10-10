@@ -1,1 +1,0 @@
-# stitch-ease-staging

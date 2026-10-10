@@ -1,0 +1,849 @@
+// ─────────────────────────────────────────────
+// CHART RENDERER — SYMS, stitchCell, buildChartTracker
+//
+// Renders the knitting chart viewport, row tracker, zoom, and legend.
+//
+// Symbol artwork is the exact vector paths from this app's own Figma
+// "Stitches" component set (mSct8t0TpsyYJad4teKfwl, node 1:258), kept in
+// their native 24-unit cell box so each glyph's inset (e.g. the triangles
+// span 4..20) is the designed padding rather than something re-derived
+// here. Every svg is 100%x100% of its container, so one set of paths
+// serves the chart (scales with --cell-sz), the legend and the notes
+// sheet. `currentColor` replaces the export's hardcoded fill/stroke so
+// the active-row color swap (.crow-active .cc-sym) keeps working.
+// ─────────────────────────────────────────────
+const SYMS = {
+  P:   '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><rect x="8" y="8" width="8" height="8" rx="4" fill="currentColor" /></svg>',
+  YO:  '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 20C16.4183 20 20 16.4183 20 12C20 7.58172 16.4183 4 12 4C7.58172 4 4 7.58172 4 12C4 16.4183 7.58172 20 12 20ZM12.0001 17.7143C15.156 17.7143 17.7143 15.1559 17.7143 12C17.7143 8.84408 15.156 6.28571 12.0001 6.28571C8.84414 6.28571 6.28577 8.84408 6.28577 12C6.28577 15.1559 8.84414 17.7143 12.0001 17.7143Z" fill="currentColor" /></svg>',
+  K2:  '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path d="M20 4V20H4L20 4Z" fill="currentColor" /></svg>',
+  SK:  '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path d="M4 4V20H20L4 4Z" fill="currentColor" /></svg>',
+  M1:  '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path d="M7.38477 4.47806V4.47903H7.38672C7.38835 4.47984 7.39133 4.48135 7.39453 4.48294C7.40094 4.48612 7.41056 4.49148 7.42285 4.49759C7.44775 4.50997 7.4844 4.5279 7.53125 4.5513C7.6256 4.59843 7.76217 4.66687 7.92969 4.7515C8.26463 4.9207 8.72451 5.15583 9.22559 5.41751C10.1988 5.92575 11.3316 6.53872 11.999 6.97318C12.7329 6.49387 13.8686 5.87939 14.8271 5.38138C15.3191 5.12575 15.7663 4.9004 16.0898 4.7388C16.2514 4.65811 16.3821 4.59298 16.4727 4.54837C16.5179 4.52609 16.5533 4.50929 16.5771 4.49759C16.5891 4.49174 16.5984 4.48692 16.6045 4.48392C16.6074 4.48249 16.6098 4.48173 16.6113 4.48099L16.6133 4.48001L16.709 4.43314L16.75 4.53079L17.2227 5.65677L17.2588 5.74368L17.1738 5.78568H17.1729L17.1719 5.78665C17.1706 5.78728 17.1686 5.78834 17.166 5.78958C17.1608 5.7921 17.1527 5.7954 17.1426 5.80032C17.1221 5.81024 17.0916 5.8253 17.0527 5.84427C16.975 5.88217 16.8625 5.93682 16.7236 6.0054C16.4454 6.14285 16.0606 6.33479 15.6357 6.55228C14.8368 6.96131 13.899 7.46106 13.2549 7.85892C14.279 8.63071 15.3451 9.56084 16.165 10.6411C17.0167 11.7633 17.6074 13.0524 17.6074 14.4947C17.6072 17.585 15.0967 20.0894 12 20.0894C8.90325 20.0894 6.3928 17.585 6.39258 14.4947C6.39258 13.0526 6.98335 11.7634 7.83496 10.6411C8.6543 9.56139 9.71884 8.63136 10.7422 7.85989C10.2488 7.56159 9.33357 7.07321 8.50781 6.64505C8.05834 6.412 7.63692 6.19637 7.32812 6.03958C7.17393 5.96129 7.04756 5.89723 6.95996 5.85306C6.91646 5.83112 6.88253 5.81392 6.85938 5.80228C6.84776 5.79644 6.83799 5.79258 6.83203 5.78958C6.82934 5.78823 6.82764 5.78641 6.82617 5.78568L6.82422 5.7847H6.82324L6.74023 5.74271L6.77637 5.65677L7.24805 4.52884L7.28906 4.43118L7.38477 4.47806ZM11.999 8.69876C11.0694 9.36548 10.0335 10.1885 9.22461 11.1509C8.39846 12.134 7.81641 13.2546 7.81641 14.4947C7.81663 16.7996 9.68926 18.6685 12 18.6685C14.3107 18.6685 16.1834 16.7996 16.1836 14.4947C16.1836 13.2546 15.6015 12.134 14.7754 11.1509C13.9662 10.188 12.929 9.36564 11.999 8.69876Z" fill="currentColor" stroke="currentColor" stroke-width="0.2" /></svg>',
+  M1L: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path d="M18 21L18 3M4 3L17.9642 11.0623" stroke="currentColor" stroke-width="2" stroke-linecap="round" /></svg>',
+  M1R: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path d="M6 21L6 3M6 11L19.9642 2.93774" stroke="currentColor" stroke-width="2" stroke-linecap="round" /></svg>',
+
+  // Pulled from the same Figma "Stitches" set (node 1:258), added for Posy —
+  // pattern-neutral additions to the shared symbol vocabulary, not specific
+  // to any one pattern's chart code.
+  K2A: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(1.000000,0.000000,0.000000,1.000000,3.999047,4.706157)" d="M-0.707107 13.8805C-1.09763 14.271 -1.09763 14.9042 -0.707107 15.2947C-0.316583 15.6852 0.316583 15.6852 0.707107 15.2947L0 14.5876L-0.707107 13.8805ZM15.2947 0.707107C15.6852 0.316583 15.6852 -0.316583 15.2947 -0.707107C14.9042 -1.09763 14.271 -1.09763 13.8805 -0.707107L14.5876 0L15.2947 0.707107ZM8.81076 5.98233C8.42024 5.59181 7.78708 5.59181 7.39655 5.98233C7.00603 6.37285 7.00603 7.00602 7.39655 7.39654L8.10366 6.68944L8.81076 5.98233ZM15.2948 15.2948C15.6853 15.6853 16.3185 15.6853 16.709 15.2948C17.0995 14.9043 17.0995 14.2711 16.709 13.8806L16.0019 14.5877L15.2948 15.2948ZM0 14.5876L0.707107 15.2947L15.2947 0.707107L14.5876 0L13.8805 -0.707107L-0.707107 13.8805L0 14.5876ZM8.10366 6.68944L7.39655 7.39654L15.2948 15.2948L16.0019 14.5877L16.709 13.8806L8.81076 5.98233L8.10366 6.68944Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  SKA: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(-1.000000,0.000000,0.000000,1.000000,20.000954,4.706157)" d="M-0.707107 13.8805C-1.09763 14.271 -1.09763 14.9042 -0.707107 15.2947C-0.316583 15.6852 0.316583 15.6852 0.707107 15.2947L0 14.5876L-0.707107 13.8805ZM15.2947 0.707107C15.6852 0.316583 15.6852 -0.316583 15.2947 -0.707107C14.9042 -1.09763 14.271 -1.09763 13.8805 -0.707107L14.5876 0L15.2947 0.707107ZM8.81076 5.98233C8.42024 5.59181 7.78708 5.59181 7.39655 5.98233C7.00603 6.37285 7.00603 7.00602 7.39655 7.39654L8.10366 6.68944L8.81076 5.98233ZM15.2948 15.2948C15.6853 15.6853 16.3185 15.6853 16.709 15.2948C17.0995 14.9043 17.0995 14.2711 16.709 13.8806L16.0019 14.5877L15.2948 15.2948ZM0 14.5876L0.707107 15.2947L15.2947 0.707107L14.5876 0L13.8805 -0.707107L-0.707107 13.8805L0 14.5876ZM8.10366 6.68944L7.39655 7.39654L15.2948 15.2948L16.0019 14.5877L16.709 13.8806L8.81076 5.98233L8.10366 6.68944Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  M1LP: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(1.000000,0.000000,0.000000,1.000000,2.999509,1.999536)" d="M15.0002 0.000412594C15.5524 0.000413109 16.0001 0.448158 16.0002 1.00041L16.0002 19.0004C16.0002 19.5527 15.5524 20.0004 15.0002 20.0004C14.448 20.0002 14.0002 19.5526 14.0002 19.0004L14.0002 9.66057L0.500155 1.86662L0.414218 1.81096C0.00334379 1.51448 -0.124749 0.948708 0.133944 0.500413C0.392785 0.0520879 0.947078 -0.120291 1.40934 0.0873267L1.50016 0.134202L14.0002 7.351L14.0002 1.00041C14.0002 0.448282 14.4481 0.000613166 15.0002 0.000412594Z" fill="currentColor" fill-rule="nonzero"/><path transform="matrix(1.000000,0.000000,0.000000,1.000000,2.999509,1.999536)" d="M4.00016 12.0004C5.65696 12.0005 7.00013 13.3436 7.00016 15.0004C7.00001 16.6571 5.65689 18.0004 4.00016 18.0004C2.34354 18.0002 1.0003 16.657 1.00016 15.0004C1.00018 13.3437 2.34347 12.0006 4.00016 12.0004Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  M1RP: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(1.000000,0.000000,0.000000,1.000000,5.000000,1.937292)" d="M14.4639 0.133967C14.942 -0.14202 15.5539 0.0221534 15.8301 0.500178C16.1062 0.978429 15.9421 1.59021 15.4639 1.86639L2 9.63983L2 19.0627C1.99987 19.6149 1.5522 20.0627 1 20.0627C0.447796 20.0627 0.000130949 19.6148 0 19.0627L0 1.06268C0.000153881 0.510524 0.44781 0.0626775 1 0.0626775C1.55219 0.0626775 1.99985 0.510524 2 1.06268L2 7.33026L14.4639 0.133967Z" fill="currentColor" fill-rule="nonzero"/><path transform="matrix(1.000000,0.000000,0.000000,1.000000,5.000000,1.937292)" d="M12 12.0627C13.6568 12.0627 15 13.4059 15 15.0627C14.9999 16.7194 13.6567 18.0626 12 18.0627C10.3432 18.0627 9.00014 16.7194 9 15.0627C9.00002 13.4058 10.3432 12.0627 12 12.0627Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  SK2PO: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(1.000000,0.000000,0.000000,1.000000,3.331784,2.699531)" d="M0.316115 0.270313C0.719114 -0.107316 1.35157 -0.086779 1.7292 0.316212L17.0661 16.6834C17.4435 17.0864 17.4231 17.7199 17.0202 18.0975C16.6173 18.4743 15.9846 18.4539 15.6071 18.0516L9.66865 11.7127L9.66865 17.6014C9.66841 18.1533 9.22062 18.6012 8.66865 18.6014C8.11652 18.6014 7.6689 18.1534 7.66865 17.6014L7.66865 11.7107L1.73018 18.0506C1.35266 18.4535 0.720122 18.4738 0.317092 18.0965C-0.0858553 17.7189 -0.106404 17.0864 0.271194 16.6834L7.29756 9.1834L0.270217 1.6834C-0.107348 1.28047 -0.0866765 0.647971 0.316115 0.270313Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  P3TOG: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(-1.000000,0.000000,0.000000,1.000000,20.668350,2.698939)" d="M0.316188 0.270122C0.719187 -0.107163 1.35174 -0.0868118 1.72927 0.316021L17.0662 16.6832C17.4437 17.0861 17.423 17.7196 17.0203 18.0973C16.6173 18.4744 15.9847 18.454 15.6072 18.0514L9.66775 11.7115L9.66775 17.6022C9.6674 18.1541 9.21982 18.6022 8.66775 18.6022C8.11583 18.602 7.6681 18.154 7.66775 17.6022L7.66775 11.7125L1.72927 18.0514C1.35163 18.454 0.719077 18.4747 0.316188 18.0973C-0.0866303 17.7198 -0.106933 17.0872 0.27029 16.6842L7.29763 9.18321L0.27029 1.68321C-0.107294 1.28021 -0.0867867 0.647743 0.316188 0.270122Z" fill="currentColor" fill-rule="nonzero"/><path transform="matrix(1.000000,0.000000,0.000000,1.000000,3.331987,2.698914)" d="M3 0C4.65682 4.08164e-05 6 1.34317 6 3C5.99986 4.65671 4.65673 5.99996 3 6C1.34323 6 0.000143986 4.65673 0 3C0 1.34315 1.34315 0 3 0Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  P3: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(-1.000000,0.000000,0.000000,1.000000,4.000000,4.000000)" d="M1 0C1 -0.552285 0.552285 -1 0 -1C-0.552285 -1 -1 -0.552285 -1 0L0 0L1 0ZM-1 16C-1 16.5523 -0.552285 17 0 17C0.552285 17 1 16.5523 1 16L0 16L-1 16ZM0 0L-1 0L-1 16L0 16L1 16L1 0L0 0Z" fill="currentColor" fill-rule="nonzero"/><path transform="matrix(-1.000000,0.000000,0.000000,1.000000,12.000000,4.000000)" d="M1 0C1 -0.552285 0.552285 -1 0 -1C-0.552285 -1 -1 -0.552285 -1 0L0 0L1 0ZM-1 16C-1 16.5523 -0.552285 17 0 17C0.552285 17 1 16.5523 1 16L0 16L-1 16ZM0 0L-1 0L-1 16L0 16L1 16L1 0L0 0Z" fill="currentColor" fill-rule="nonzero"/><path transform="matrix(-1.000000,0.000000,0.000000,1.000000,20.000000,4.000000)" d="M1 0C1 -0.552285 0.552285 -1 0 -1C-0.552285 -1 -1 -0.552285 -1 0L0 0L1 0ZM-1 16C-1 16.5523 -0.552285 17 0 17C0.552285 17 1 16.5523 1 16L0 16L-1 16ZM0 0L-1 0L-1 16L0 16L1 16L1 0L0 0Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  SSP: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(1.000000,0.000000,0.000000,1.000000,4.000000,4.000000)" d="M16 16L0 16L0 0L16 16Z" fill="currentColor" fill-rule="nonzero"/><path transform="matrix(1.000000,0.000000,0.000000,1.000000,4.000000,4.000000)" d="M13 0C14.6568 4.08164e-05 16 1.34317 16 3C15.9999 4.65671 14.6567 5.99996 13 6C11.3432 6 10.0001 4.65673 10 3C10 1.34315 11.3431 0 13 0Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  P2TOG: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(1.000000,0.000000,0.000000,1.000000,4.000000,4.000000)" d="M16 16L0 16L16 0L16 16Z" fill="currentColor" fill-rule="nonzero"/><path transform="matrix(1.000000,0.000000,0.000000,1.000000,4.000000,4.000000)" d="M3 0C4.65682 4.08164e-05 6 1.34317 6 3C5.99986 4.65671 4.65673 5.99996 3 6C1.34323 6 0.000143986 4.65673 0 3C0 1.34315 1.34315 0 3 0Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  KTBL: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(1.000000,0.000000,0.000000,-1.000000,6.492209,19.989716)" d="M9.79163 9.92635C9.79163 7.3811 7.4013 5.35826 5.50779 4.00711C3.61428 5.35826 1.22395 7.3811 1.22395 9.92635C1.22395 12.287 3.14189 14.2006 5.50779 14.2006C7.87369 14.2006 9.79163 12.287 9.79163 9.92635ZM11.0156 9.92635C11.0156 12.9614 8.54966 15.4218 5.50779 15.4218C2.46592 15.4218 0 12.9614 0 9.92635C0 7.09936 2.31661 4.85425 4.42886 3.28201C3.52053 2.70453 0.376111 1.1274 0.376111 1.1274L0.847843 0C0.847843 0 4.20052 1.65947 5.50779 2.52512C6.96041 1.56322 10.1653 0.0015901 10.1653 0.0015901L10.6379 1.1274C10.6379 1.1274 7.88139 2.45836 6.58592 3.28201C8.69853 4.85443 11.0156 7.09872 11.0156 9.92635Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  PTBL: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(1.000000,0.000000,0.000000,-1.000000,6.492209,19.989716)" d="M9.79163 9.92635C9.79163 7.3811 7.4013 5.35826 5.50779 4.00711C3.61428 5.35826 1.22395 7.3811 1.22395 9.92635C1.22395 12.287 3.14189 14.2006 5.50779 14.2006C7.87369 14.2006 9.79163 12.287 9.79163 9.92635ZM11.0156 9.92635C11.0156 12.9614 8.54966 15.4218 5.50779 15.4218C2.46592 15.4218 0 12.9614 0 9.92635C0 7.09936 2.31661 4.85425 4.42886 3.28201C3.52053 2.70453 0.376111 1.1274 0.376111 1.1274L0.847843 0C0.847843 0 4.20052 1.65947 5.50779 2.52512C6.96041 1.56322 10.1653 0.0015901 10.1653 0.0015901L10.6379 1.1274C10.6379 1.1274 7.88139 2.45836 6.58592 3.28201C8.69853 4.85443 11.0156 7.09872 11.0156 9.92635Z" fill="currentColor" fill-rule="nonzero"/><path transform="matrix(1.000000,0.000000,0.000000,1.000000,9.000000,7.310184)" d="M3 0C4.65682 4.08164e-05 6 1.34317 6 3C5.99986 4.65671 4.65673 5.99996 3 6C1.34323 6 0.000143986 4.65673 0 3C0 1.34315 1.34315 0 3 0Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  TK2TOG: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(1.000000,0.000000,0.000000,1.000000,3.999023,4.387884)" d="M-0.707106 14.5171C-1.09763 14.9076 -1.09763 15.5407 -0.707107 15.9313C-0.316583 16.3218 0.316582 16.3218 0.707106 15.9313L0 15.2242L-0.707106 14.5171ZM14.5876 0.636546L15.2947 1.34365L14.5876 0.636546ZM8.81076 6.61888C8.42024 6.22835 7.78708 6.22835 7.39655 6.61888C7.00603 7.0094 7.00603 7.64257 7.39655 8.03309L8.10366 7.32598L8.81076 6.61888ZM15.2948 15.9313C15.6853 16.3219 16.3185 16.3219 16.709 15.9313C17.0995 15.5408 17.0995 14.9076 16.709 14.5171L16.0019 15.2242L15.2948 15.9313ZM15.5317 4.70228L14.8565 3.96461L14.8565 3.96461L15.5317 4.70228ZM2.63553 0.81786C2.15132 0.552222 1.54346 0.729405 1.27782 1.21361C1.01218 1.69781 1.18936 2.30568 1.67357 2.57132L2.15455 1.69459L2.63553 0.81786ZM0 15.2242C0.707106 15.9313 0.707139 15.9312 0.707205 15.9312C0.707271 15.9311 0.70737 15.931 0.707501 15.9309C0.707765 15.9306 0.708157 15.9302 0.708683 15.9297C0.709732 15.9286 0.711304 15.9271 0.713392 15.925C0.717567 15.9208 0.723809 15.9146 0.732074 15.9063C0.748603 15.8898 0.773225 15.8651 0.805592 15.8328C0.870327 15.768 0.966046 15.6723 1.08998 15.5484C1.33785 15.3005 1.6986 14.9398 2.15007 14.4883C3.05302 13.5854 4.3189 12.3195 5.77064 10.8677C8.67412 7.96425 12.321 4.31735 15.2947 1.34365L14.5876 0.636546L13.8805 -0.0705604C10.9068 2.90314 7.25991 6.55004 4.35643 9.45352C2.90469 10.9053 1.63881 12.1711 0.735857 13.0741C0.284382 13.5256 -0.0763586 13.8863 -0.324231 14.1342C-0.448167 14.2581 -0.543886 14.3538 -0.608621 14.4186C-0.640988 14.4509 -0.66561 14.4756 -0.682139 14.4921C-0.690404 14.5003 -0.696646 14.5066 -0.700821 14.5108C-0.702909 14.5129 -0.70448 14.5144 -0.70553 14.5155C-0.706055 14.516 -0.706448 14.5164 -0.706712 14.5167C-0.706843 14.5168 -0.706942 14.5169 -0.707008 14.517C-0.707074 14.517 -0.707106 14.5171 0 15.2242ZM8.10366 7.32598L7.39655 8.03309L15.2948 15.9313L16.0019 15.2242L16.709 14.5171L8.81076 6.61888L8.10366 7.32598ZM14.5876 0.636546L15.2947 1.34365C15.6992 0.939198 15.8721 1.01099 15.8167 0.999513C15.7592 0.98759 15.8559 0.969379 15.9433 1.23549C16.1158 1.76113 16.0054 2.91307 14.8565 3.96461L15.5317 4.70228L16.2069 5.43995C17.826 3.95804 18.3045 2.01609 17.8435 0.611728C17.6141 -0.0871716 17.0885 -0.779423 16.2225 -0.95888C15.3587 -1.13789 14.5371 -0.727125 13.8805 -0.0705604L14.5876 0.636546ZM15.5317 4.70228L14.8565 3.96461C14.4541 4.33297 13.637 4.52928 12.3039 4.38089C11.0272 4.23877 9.53403 3.80887 8.07781 3.27502C6.6313 2.74474 5.26815 2.12954 4.26319 1.64469C3.76182 1.4028 3.35219 1.19462 3.069 1.0475C2.92746 0.973967 2.81765 0.915768 2.74392 0.876334C2.70707 0.856619 2.67924 0.841601 2.66099 0.831711C2.65187 0.826766 2.64514 0.823103 2.64087 0.820777C2.63874 0.819613 2.63722 0.818784 2.63633 0.818296C2.63588 0.818052 2.63559 0.817893 2.63546 0.81782C2.63539 0.817783 2.63541 0.817794 2.63537 0.817775C2.63543 0.817807 2.63553 0.81786 2.15455 1.69459C1.67357 2.57132 1.67374 2.57142 1.67396 2.57154C1.67409 2.57161 1.67434 2.57175 1.67459 2.57188C1.67509 2.57216 1.67575 2.57252 1.67657 2.57297C1.6782 2.57386 1.68047 2.5751 1.68335 2.57667C1.68912 2.57982 1.69738 2.58431 1.70806 2.5901C1.72942 2.60167 1.76045 2.61842 1.80062 2.63991C1.88096 2.68287 1.99787 2.74483 2.14699 2.82229C2.44511 2.97717 2.87254 3.19436 3.39414 3.44601C4.4351 3.94822 5.86148 4.59268 7.38942 5.15282C8.90765 5.70939 10.5739 6.20066 12.0827 6.36861C13.5352 6.53029 15.13 6.42557 16.2069 5.43995L15.5317 4.70228Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  TSSK: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(-1.000000,0.000000,0.000000,1.000000,21.008293,4.387884)" d="M-0.707106 14.5171C-1.09763 14.9076 -1.09763 15.5407 -0.707107 15.9313C-0.316583 16.3218 0.316582 16.3218 0.707106 15.9313L0 15.2242L-0.707106 14.5171ZM14.5876 0.636546L15.2947 1.34365L14.5876 0.636546ZM8.81076 6.61888C8.42024 6.22835 7.78708 6.22835 7.39655 6.61888C7.00603 7.0094 7.00603 7.64257 7.39655 8.03309L8.10366 7.32598L8.81076 6.61888ZM15.2948 15.9313C15.6853 16.3219 16.3185 16.3219 16.709 15.9313C17.0995 15.5408 17.0995 14.9076 16.709 14.5171L16.0019 15.2242L15.2948 15.9313ZM15.5317 4.70228L14.8565 3.96461L14.8565 3.96461L15.5317 4.70228ZM2.63553 0.81786C2.15132 0.552222 1.54346 0.729405 1.27782 1.21361C1.01218 1.69781 1.18936 2.30568 1.67357 2.57132L2.15455 1.69459L2.63553 0.81786ZM0 15.2242C0.707106 15.9313 0.707139 15.9312 0.707205 15.9312C0.707271 15.9311 0.70737 15.931 0.707501 15.9309C0.707765 15.9306 0.708157 15.9302 0.708683 15.9297C0.709732 15.9286 0.711304 15.9271 0.713392 15.925C0.717567 15.9208 0.723809 15.9146 0.732074 15.9063C0.748603 15.8898 0.773225 15.8651 0.805592 15.8328C0.870327 15.768 0.966046 15.6723 1.08998 15.5484C1.33785 15.3005 1.6986 14.9398 2.15007 14.4883C3.05302 13.5854 4.3189 12.3195 5.77064 10.8677C8.67412 7.96425 12.321 4.31735 15.2947 1.34365L14.5876 0.636546L13.8805 -0.0705604C10.9068 2.90314 7.25991 6.55004 4.35643 9.45352C2.90469 10.9053 1.63881 12.1711 0.735857 13.0741C0.284382 13.5256 -0.0763586 13.8863 -0.324231 14.1342C-0.448167 14.2581 -0.543886 14.3538 -0.608621 14.4186C-0.640988 14.4509 -0.66561 14.4756 -0.682139 14.4921C-0.690404 14.5003 -0.696646 14.5066 -0.700821 14.5108C-0.702909 14.5129 -0.70448 14.5144 -0.70553 14.5155C-0.706055 14.516 -0.706448 14.5164 -0.706712 14.5167C-0.706843 14.5168 -0.706942 14.5169 -0.707008 14.517C-0.707074 14.517 -0.707106 14.5171 0 15.2242ZM8.10366 7.32598L7.39655 8.03309L15.2948 15.9313L16.0019 15.2242L16.709 14.5171L8.81076 6.61888L8.10366 7.32598ZM14.5876 0.636546L15.2947 1.34365C15.6992 0.939198 15.8721 1.01099 15.8167 0.999513C15.7592 0.98759 15.8559 0.969379 15.9433 1.23549C16.1158 1.76113 16.0054 2.91307 14.8565 3.96461L15.5317 4.70228L16.2069 5.43995C17.826 3.95804 18.3045 2.01609 17.8435 0.611728C17.6141 -0.0871716 17.0885 -0.779423 16.2225 -0.95888C15.3587 -1.13789 14.5371 -0.727125 13.8805 -0.0705604L14.5876 0.636546ZM15.5317 4.70228L14.8565 3.96461C14.4541 4.33297 13.637 4.52928 12.3039 4.38089C11.0272 4.23877 9.53403 3.80887 8.07781 3.27502C6.6313 2.74474 5.26815 2.12954 4.26319 1.64469C3.76182 1.4028 3.35219 1.19462 3.069 1.0475C2.92746 0.973967 2.81765 0.915768 2.74392 0.876334C2.70707 0.856619 2.67924 0.841601 2.66099 0.831711C2.65187 0.826766 2.64514 0.823103 2.64087 0.820777C2.63874 0.819613 2.63722 0.818784 2.63633 0.818296C2.63588 0.818052 2.63559 0.817893 2.63546 0.81782C2.63539 0.817783 2.63541 0.817794 2.63537 0.817775C2.63543 0.817807 2.63553 0.81786 2.15455 1.69459C1.67357 2.57132 1.67374 2.57142 1.67396 2.57154C1.67409 2.57161 1.67434 2.57175 1.67459 2.57188C1.67509 2.57216 1.67575 2.57252 1.67657 2.57297C1.6782 2.57386 1.68047 2.5751 1.68335 2.57667C1.68912 2.57982 1.69738 2.58431 1.70806 2.5901C1.72942 2.60167 1.76045 2.61842 1.80062 2.63991C1.88096 2.68287 1.99787 2.74483 2.14699 2.82229C2.44511 2.97717 2.87254 3.19436 3.39414 3.44601C4.4351 3.94822 5.86148 4.59268 7.38942 5.15282C8.90765 5.70939 10.5739 6.20066 12.0827 6.36861C13.5352 6.53029 15.13 6.42557 16.2069 5.43995L15.5317 4.70228Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  CDD: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(1.000000,0.000000,0.000000,1.000000,3.014719,3.207102)" d="M7.60974 8.63173C7.805 8.82699 7.805 9.14357 7.60974 9.33883L4.23165 12.7169C4.03638 12.9122 3.7198 12.9122 3.52454 12.7169L0.146447 9.33883C-0.0488155 9.14357 -0.0488156 8.82699 0.146447 8.63173L3.52454 5.25364C3.7198 5.05837 4.03638 5.05837 4.23165 5.25364L7.60974 8.63173Z" fill="currentColor" fill-rule="nonzero"/><path transform="matrix(1.000000,0.000000,0.000000,1.000000,3.014719,3.207102)" d="M12.7169 13.7389C12.9122 13.9342 12.9122 14.2508 12.7169 14.446L9.33883 17.8241C9.14357 18.0194 8.82699 18.0194 8.63173 17.8241L5.25364 14.446C5.05837 14.2508 5.05838 13.9342 5.25364 13.7389L8.63173 10.3608C8.82699 10.1656 9.14357 10.1656 9.33883 10.3608L12.7169 13.7389Z" fill="currentColor" fill-rule="nonzero"/><path transform="matrix(1.000000,0.000000,0.000000,1.000000,3.014719,3.207102)" d="M12.7169 3.52454C12.9122 3.7198 12.9122 4.03638 12.7169 4.23165L9.33883 7.60974C9.14357 7.805 8.82699 7.805 8.63173 7.60974L5.25364 4.23165C5.05837 4.03638 5.05837 3.7198 5.25364 3.52454L8.63173 0.146446C8.82699 -0.0488154 9.14357 -0.0488156 9.33883 0.146446L12.7169 3.52454Z" fill="currentColor" fill-rule="nonzero"/><path transform="matrix(1.000000,0.000000,0.000000,1.000000,3.014719,3.207102)" d="M17.8241 8.63173C18.0194 8.82699 18.0194 9.14357 17.8241 9.33883L14.446 12.7169C14.2508 12.9122 13.9342 12.9122 13.7389 12.7169L10.3608 9.33883C10.1656 9.14357 10.1656 8.82699 10.3608 8.63173L13.7389 5.25364C13.9342 5.05837 14.2508 5.05837 14.446 5.25364L17.8241 8.63173Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  // "Pull up stitch" (drop-stitch, insert-3-rows-below move) is genuinely
+  // taller than one cell in Figma — clipsContent:true confirms the frame is
+  // meant to show only the anchor tip + the row-count label, with the rest
+  // of the shape bleeding into the (unrendered, per-cell) rows above. The
+  // <text> label isn't in fillGeometry (the API doesn't outline text glyphs
+  // without an explicit request), so it's added here as a real <text> node
+  // at the same position/size Figma reports for it.
+  PU: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block;overflow:hidden"><path transform="matrix(-1.000000,0.000000,-0.000000,-1.000000,20.000000,92.000000)" d="M8 0L8.99589 -0.0905357C8.94907 -0.605615 8.5172 -1 8 -1C7.4828 -1 7.05093 -0.605615 7.00411 -0.0905357L8 0ZM15.0041 88.0905C15.0541 88.6405 15.5405 89.0459 16.0905 88.9959C16.6406 88.9459 17.0459 88.4595 16.9959 87.9095L16 88L15.0041 88.0905ZM-0.995893 87.9095C-1.04589 88.4595 -0.640552 88.9459 -0.0905357 88.9959C0.459481 89.0459 0.945892 88.6405 0.995893 88.0905L0 88L-0.995893 87.9095ZM8 0L7.00411 0.0905357L15.0041 88.0905L16 88L16.9959 87.9095L8.99589 -0.0905357L8 0ZM0 88L0.995893 88.0905L8.99589 0.0905357L8 0L7.00411 -0.0905357L-0.995893 87.9095L0 88Z" fill="currentColor" fill-rule="nonzero"/><text x="12" y="11.8" text-anchor="middle" dominant-baseline="central" font-size="12" font-family="-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif" fill="currentColor">3</text></svg>',
+  GP: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(1.000000,0.000000,0.000000,1.000000,8.000000,8.000000)" d="M4 0C6.20914 0 8 1.79086 8 4C8 6.20914 6.20914 8 4 8C1.79086 8 0 6.20914 0 4C0 1.79086 1.79086 0 4 0ZM2.25879 6.44043C2.74999 6.79152 3.35019 7 4 7C5.65685 7 7 5.65685 7 4C7 3.35019 6.79152 2.74999 6.44043 2.25879L2.25879 6.44043ZM4 1C2.34315 1 1 2.34315 1 4C1 4.64581 1.20557 5.2429 1.55273 5.73242L5.73242 1.55273C5.2429 1.20557 4.64581 1 4 1Z" fill="currentColor" fill-rule="evenodd"/></svg>',
+  BRK: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(1.000000,0.000000,0.000000,1.000000,4.000000,2.000000)" d="M8 0C12.4183 0 16 3.58172 16 8L16 20L14.5 20L14.5 7.9375L14.4961 7.9375C14.4098 4.42276 11.5355 1.59961 8 1.59961C4.46449 1.59961 1.59017 4.42276 1.50391 7.9375L1.5 7.9375L1.5 20L0 20L0 8C0 3.58172 3.58172 0 8 0Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  BRP: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path transform="matrix(1.000000,0.000000,0.000000,1.000000,4.000000,2.000000)" d="M8 0C12.4183 0 16 3.58172 16 8L16 20L14.5 20L14.5 7.9375L14.4961 7.9375C14.4098 4.42276 11.5355 1.59961 8 1.59961C4.46449 1.59961 1.59017 4.42276 1.50391 7.9375L1.5 7.9375L1.5 20L0 20L0 8C0 3.58172 3.58172 0 8 0Z" fill="currentColor" fill-rule="nonzero"/><path transform="matrix(1.000000,0.000000,0.000000,1.000000,4.000000,2.000000)" d="M4 9C4 6.79086 5.79086 5 8 5C10.2091 5 12 6.79086 12 9C12 11.2091 10.2091 13 8 13C5.79086 13 4 11.2091 4 9Z" fill="currentColor" fill-rule="nonzero"/></svg>',
+  // Slipped stitch, yarn held in front (sl_wyif) — pulled from this app's
+  // Figma stitch-glyph library (StitchEase designer library, node 12:87): a
+  // purl-style dot above a downward chevron. Added for colorwork charts
+  // imported from other tools (see the colorwork section below);
+  // pattern-neutral, not specific to any one pattern.
+  SL: '<svg width="100%" height="100%" viewBox="0 0 24 24" style="display:block"><path d="M12 4C13.6568 4.00004 15 5.34317 15 7C14.9999 8.65671 13.6567 9.99996 12 10C10.3432 10 9.00014 8.65673 9 7C9 5.34315 10.3431 4 12 4Z" fill="currentColor"/><path d="M4 7L12 20L20 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+};
+
+function cellYarn(c) { return Number.isInteger(c) && c >= 0 && c < 32 ? c : null; }
+
+function chartColorRow(row) {
+  const grid = PHASES[cur] && PHASES[cur].chartColors;
+  return (grid && grid[row - 1]) || null;
+}
+
+function parseColorCell(type) {
+  const i = type.indexOf(':');
+  if (i < 0) return { t: type, ci: null };
+  return { t: type.slice(0, i), ci: parseInt(type.slice(i + 1), 10) };
+}
+
+function normalizeHexColor(hex) {
+  if (typeof hex !== 'string') return null;
+  const match = /^#?([a-f\d]{3}|[a-f\d]{6})$/i.exec(hex.trim());
+  if (!match) return null;
+  const value = match[1];
+  return '#' + (value.length === 3
+    ? value.split('').map(ch => ch + ch).join('')
+    : value).toLowerCase();
+}
+
+function colorHexFor(ci) {
+  const entry = projectColors[ci];
+  const savedHex = normalizeHexColor(entry && entry.hex);
+  if (savedHex) return savedHex;
+  const palette = PHASES[cur] && PHASES[cur].colorPalette;
+  return normalizeHexColor(palette && palette[ci]) || '#cccccc';
+}
+
+// The color for a chart row, when the whole row is one color (an `allWS`
+// illusion/colorwork phase — see js/patterns/where-are-the-leaves.js —
+// never a mixed-color row like Peacock Tee's yoke chart, where this would
+// be meaningless and callers shouldn't ask). Reads the color straight off
+// the row's own cells rather than assuming an odd/even rule, so it can't
+// drift out of sync with what the chart actually stores. Returns null if
+// the row has no colorwork cells at all (a plain stitch-only pattern, or
+// an all-'E' row).
+function rowColorInfo(row) {
+  const cells = (CHART_B[row - 1] || []);
+  for (const c of cells) {
+    const { ci } = parseColorCell(c);
+    if (ci !== null) {
+      const entry = projectColors[ci];
+      return entry ? { name: entry.name, hex: colorHexFor(ci) } : null;
+    }
+  }
+  return null;
+}
+function rowColorName(row) {
+  const info = rowColorInfo(row);
+  return info ? info.name : null;
+}
+
+// WCAG-ish relative luminance → plain black/white symbol color, so a
+// knitter can read the glyph regardless of how dark or light they picked
+// that yarn's color to be.
+function contrastText(hex) {
+  const normalized = normalizeHexColor(hex);
+  const m = normalized && /^#([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(normalized);
+  if (!m) return '#000';
+  const rgb = [m[1], m[2], m[3]].map(h => parseInt(h, 16) / 255);
+  const lin = c => (c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+  return 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2]) > 0.45 ? '#000' : '#fff';
+}
+
+const CC_TINT_AMOUNT = 0.72;
+function tintHex(hex) {
+  const normalized = normalizeHexColor(hex);
+  const m = normalized && /^#([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(normalized);
+  if (!m) return hex;
+  const mix = h => Math.round(parseInt(h, 16) + (255 - parseInt(h, 16)) * CC_TINT_AMOUNT).toString(16).padStart(2, '0');
+  return '#' + mix(m[1]) + mix(m[2]) + mix(m[3]);
+}
+
+function cellDisplayHex(ci, isActive) {
+  const hex = colorHexFor(ci);
+  return isActive ? hex : tintHex(hex);
+}
+
+function stitchCell(type, segEnd, yarn, isActive) {
+  let cls = 'cc' + (segEnd ? ' cc-seg-end' : '');
+  if (type === 'E') return `<div class="${cls} cc-e"></div>`;
+  const { t, ci } = parseColorCell(type);
+  const sym = SYMS[t] || '';
+  if (ci !== null) {
+    const hex = cellDisplayHex(ci, isActive);
+    const fg = contrastText(hex);
+    return `<div class="${cls}" data-ci="${ci}" style="background-color:${hex};--cc-ring:${fg}">` +
+      (sym ? `<span class="cc-sym" style="color:${fg}">${sym}</span>` : '') + `</div>`;
+  }
+  const y = cellYarn(yarn);
+  if (y !== null) cls += ' cc-col';
+  const style = y !== null ? ` style="--cc-bg:var(--yarn-${y});--cc-fg:var(--yarn-${y}-fg)"` : '';
+  return `<div class="${cls}"${style}>${sym ? `<span class="cc-sym">${sym}</span>` : ''}</div>`;
+}
+
+function rowNumCell(rowNum, side, isActive, isDone) {
+  let cls = 'cc cc-rownum cc-rownum-' + side;
+  if (isActive) cls += ' crow-num-active';
+  else if (isDone) cls += ' crow-num-done';
+  return `<div class="${cls}">${rowNum}</div>`;
+}
+
+function repaintRowColors(rowEl, isActive) {
+  if (!rowEl) return;
+  rowEl.querySelectorAll('.cc[data-ci]').forEach(cellEl => {
+    const ci = parseInt(cellEl.dataset.ci, 10);
+    const hex = cellDisplayHex(ci, isActive);
+    const fg = contrastText(hex);
+    cellEl.style.backgroundColor = hex;
+    cellEl.style.setProperty('--cc-ring', fg);
+    const sym = cellEl.querySelector('.cc-sym');
+    if (sym) sym.style.color = fg;
+  });
+}
+
+// Column indices (0-based) where a combined chart's source panel ends — the
+// last stitch of Chart 5, then Chart 4, etc. Drawn as a divider so a knitter
+// can tell "that's the end of Chart 4, this next bit is Chart 3" instead of
+// the combined 120 or 234-stitch row reading as one undifferentiated blur.
+// A phase's chart is source panels concatenated column-wise (see
+// js/patterns/posy.js's POSY_BACK_CHART/POSY_BODY_HEM_CHART); chartSegments
+// is just the width of each panel in that same order. The last panel's own
+// end isn't marked — there's nothing after it to divide from.
+function segEndCols(phase) {
+  const segments = phase && phase.chartSegments;
+  if (!segments || segments.length < 2) return null;
+  const cols = new Set();
+  let acc = 0;
+  for (let i = 0; i < segments.length - 1; i++) { acc += segments[i]; cols.add(acc - 1); }
+  return cols;
+}
+
+// ─────────────────────────────────────────────
+// ROW VIRTUALIZATION — only rows within the scrollable viewport (plus a
+// buffer) are ever real DOM nodes; everything else is spacer height. Needed
+// once a chart got big (263×135 ≈ 35,000 divs for a full render) — the
+// scrollbar and all the pixel-offset math below (scrollChartToCurrent,
+// getRowH, the mid-row line) already compute purely from row index × cellSz,
+// so they stay correct against a spacer-based layout without any changes:
+// what matters is that #chart-inner's total height still equals
+// padding + CHART_TOTAL * ROW_H, which holds for any valid spacer split.
+// ─────────────────────────────────────────────
+const CHART_BUFFER_ROWS = 12;
+let chartWinFirst = -1, chartWinLast = -1; // currently-mounted visual-index window
+
+// COLUMN CROPPING — a chart with shaping (raglan/set-in increases, etc.)
+// marks not-yet-existing stitches 'E' (no-stitch), often a long run of them
+// on either edge of every row early in the section. Those don't need real
+// DOM cells any more than an off-screen row does, so each mount also crops
+// to the columns actually in use across the rows being rendered — a couple
+// of blank columns are kept on each side for visual clarity, and the crop
+// only ever trims the OUTER edges (an 'E' gap in the middle of a row, e.g. a
+// split front/back panel, stays fully rendered since it's still between two
+// active edges). Recomputed per render (same rows as the vertical window),
+// so it widens on its own as scrolling reaches rows with more active
+// stitches — exactly the "add a column per increase row" behavior wanted.
+const CHART_COL_PAD = 2;
+let chartColStart = 0, chartColEnd = 0; // currently-rendered column range (inclusive), real indices
+
+// The widest active-stitch range across rows [rowBottom, rowTop] (inclusive,
+// real 1-based row numbers) — i.e. the same rows about to be mounted.
+function activeColRange(rowBottom, rowTop) {
+  const cols = CHART_B[0] ? CHART_B[0].length : 0;
+  let minCol = cols, maxCol = -1;
+  for (let r = rowBottom; r <= rowTop; r++) {
+    const row = CHART_B[r - 1];
+    if (!row) continue;
+    for (let ci = 0; ci < row.length; ci++) { if (row[ci] !== 'E') { if (ci < minCol) minCol = ci; break; } }
+    for (let ci = row.length - 1; ci >= 0; ci--) { if (row[ci] !== 'E') { if (ci > maxCol) maxCol = ci; break; } }
+    if (minCol === 0 && maxCol === cols - 1) break; // can't narrow further
+  }
+  if (maxCol < minCol) return { colStart: 0, colEnd: Math.max(0, cols - 1) }; // rows were all no-stitch — show as-is
+  return { colStart: Math.max(0, minCol - CHART_COL_PAD), colEnd: Math.min(cols - 1, maxCol + CHART_COL_PAD) };
+}
+
+// One row's HTML — visual index 0 is CHART_TOTAL (top), CHART_TOTAL-1 is
+// row 1 (bottom); see buildChartTracker's row-order note below. colStart/
+// colEnd (inclusive) are the shared crop for the whole mounted window — see
+// the COLUMN CROPPING note above.
+function chartRowHtml(r, segEnds, colStart, colEnd) {
+  const rowData = CHART_B[r - 1];
+  const isActive = (r === chartCurrentRow);
+  const isDone   = (r < chartCurrentRow);
+
+  let html = `<div class="crow${isActive ? ' crow-active' : ''}" data-row="${r}">`;
+  html += rowNumCell(r, 'l', isActive, isDone);
+  html += '<div class="crow-cells">';
+  const rowColors = chartColorRow(r);
+  for (let ci = colStart; ci <= colEnd; ci++) html += stitchCell(rowData[ci], segEnds && segEnds.has(ci), rowColors && rowColors[ci], isActive);
+  html += '</div>';
+  html += rowNumCell(r, 'r', isActive, isDone);
+  html += '</div>';
+  return html;
+}
+
+// Which visual-index window (0-based, 0 = top = row CHART_TOTAL) should be
+// mounted, given the viewport's current scroll position. Falls back to a
+// window centered on the current row when the viewport isn't mounted yet
+// (the very first build) — see initialChartRange().
+function chartWindowRange() {
+  const vp = document.getElementById('chart-vp');
+  if (!vp) return initialChartRange();
+  const ROW_H = getRowH();
+  const padTop = parseFloat(getComputedStyle(document.getElementById('chart-inner') || vp).paddingTop) || 2;
+  const scrollTop = vp.scrollTop;
+  const vpH = vp.clientHeight || 380;
+  let first = Math.floor((scrollTop - padTop) / ROW_H) - CHART_BUFFER_ROWS;
+  let last  = Math.ceil((scrollTop + vpH - padTop) / ROW_H) + CHART_BUFFER_ROWS;
+  first = Math.max(0, first);
+  last = Math.min(CHART_TOTAL - 1, Math.max(first, last));
+  return { first, last };
+}
+
+// Used only before #chart-vp exists in the DOM (the initial buildChartTracker
+// call) — approximates the viewport with the CSS default height so the first
+// paint already brackets the current row; the real window (from actual
+// scrollTop/clientHeight) gets mounted on the very next scroll event.
+function initialChartRange() {
+  const ROW_H = getRowH();
+  const visIdx = CHART_TOTAL - chartCurrentRow;
+  const approxVisibleRows = Math.ceil(380 / ROW_H) + 2 * CHART_BUFFER_ROWS;
+  let first = visIdx - Math.floor(approxVisibleRows / 2);
+  let last = first + approxVisibleRows;
+  first = Math.max(0, first);
+  last = Math.min(CHART_TOTAL - 1, Math.max(first, last));
+  return { first, last };
+}
+
+function renderChartWindow(range) {
+  const ROW_H = getRowH();
+  const segEnds = segEndCols(PHASES[cur]);
+  // Rows render top-to-bottom visually (row CHART_TOTAL at top, row 1 at
+  // bottom); visIdx `first` (smallest, topmost) is the highest row number.
+  const rowTop = CHART_TOTAL - range.first, rowBottom = CHART_TOTAL - range.last;
+  const colRange = activeColRange(rowBottom, rowTop);
+  chartColStart = colRange.colStart;
+  chartColEnd = colRange.colEnd;
+  let html = `<div class="chart-spacer-top" style="height:${range.first * ROW_H}px"></div>`;
+  for (let r = rowTop; r >= rowBottom; r--) html += chartRowHtml(r, segEnds, chartColStart, chartColEnd);
+  html += `<div class="chart-spacer-bottom" style="height:${(CHART_TOTAL - 1 - range.last) * ROW_H}px"></div>`;
+  html += '<div class="mid-row-line" id="mid-row-line"></div>';
+  return html;
+}
+
+function mountChartWindow(range, force) {
+  if (!force && range.first === chartWinFirst && range.last === chartWinLast) return;
+  const inner = document.getElementById('chart-inner');
+  if (!inner) return;
+  chartWinFirst = range.first;
+  chartWinLast = range.last;
+  inner.innerHTML = renderChartWindow(range);
+  updateMidRowLine();
+}
+
+// Wired to #chart-vp's onscroll. Fires on every scroll tick, so the window
+// recompute is rAF-throttled — updateMidRowHandle (cheap, no DOM rebuild)
+// still runs every tick for a smooth-tracking handle.
+let chartScrollRaf = null;
+function onChartScroll() {
+  updateMidRowHandle();
+  if (chartScrollRaf) return;
+  chartScrollRaf = requestAnimationFrame(() => {
+    chartScrollRaf = null;
+    mountChartWindow(chartWindowRange());
+  });
+}
+
+function buildChartTracker(phaseHeaderHtml) {
+  let html = '<div class="chart-tracker">';
+
+  // Top panel: just the phase header (minimized grab bar when idle) — the
+  // general instructions now live in the row recap dock, and the zoom
+  // controls sit next to the recenter FAB (see chart-stage below).
+  html += `<div class="chart-overlay-top" id="chart-overlay-top">`;
+  html += phaseHeaderHtml;
+  html += '</div>';
+
+  // Stage: the scrolling chart viewport + floating recenter/zoom buttons
+  html += '<div class="chart-stage">';
+  html += '<div class="chart-vp" id="chart-vp" onscroll="onChartScroll()"><div class="chart-inner" id="chart-inner">';
+
+  // Only the rows within (a buffer around) the viewport are mounted — see
+  // the ROW VIRTUALIZATION section above. The rest of the chart is spacer
+  // height, so the scrollbar and current-row math are unaffected.
+  const initRange = initialChartRange();
+  chartWinFirst = initRange.first;
+  chartWinLast = initRange.last;
+  html += renderChartWindow(initRange);
+  html += '</div></div>'; // chart-inner + chart-vp
+  // Drag handle for the mid-row line — lives in its own strip BELOW the
+  // scrolling grid (a sibling of #chart-vp, not inside it), so it never
+  // covers a row of stitches. Directly below wherever the line currently
+  // sits on screen, tracking it through both zoom and horizontal scroll
+  // (see updateMidRowHandle). Position is set entirely by JS.
+  html += '<div class="mid-row-track"><div class="mid-row-handle" id="mid-row-handle" onpointerdown="startMidRowDrag(event)"></div></div>';
+  html += '</div>'; // chart-stage
+
+  // Bottom panel: legend (kept for the pattern-notes sheet, hidden here)
+  html += `<div class="chart-overlay-bottom" id="chart-overlay-bottom">`;
+
+  // Colorwork palette — this pattern's yarn colors, editable per project
+  // (see openColorSheet() in render.js). Only present on a colorwork chart.
+  const pal = PHASES[cur] && PHASES[cur].colorPalette;
+  if (pal) {
+    html += '<div class="chart-legend chart-color-legend">';
+    pal.forEach((defHex, i) => {
+      const c = projectColors[i] || { name: 'Color ' + (i + 1), hex: defHex };
+      html += `<div class="leg"><div class="leg-cc leg-swatch" style="background:${colorHexFor(i)}"></div>${escapeHtml(c.name)}</div>`;
+    });
+    html += `<button class="phase-folder color-edit-btn" onclick="openColorSheet()" aria-label="Edit yarn colors" title="Edit yarn colors">${PALETTE_SVG}</button>`;
+    html += '</div>';
+  }
+
+  html += `<div class="chart-legend">
+    <div class="leg"><div class="leg-cc"></div>knit</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.P}</div>purl</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.YO}</div>yarn over</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.K2}</div>k2tog</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.SK}</div>SKPO</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.M1}</div>M1</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.M1L}</div>M1L</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.M1R}</div>M1R</div>
+    <div class="leg"><div class="leg-cc leg-cc-e"></div>no stitch</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.K2A}</div>k2tog</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.SKA}</div>ssk</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.SSP}</div>ssp</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.P2TOG}</div>p2tog</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.KTBL}</div>ktbl</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.PTBL}</div>ptbl</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.TK2TOG}</div>tk2tog</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.TSSK}</div>tssk</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.CDD}</div>sl2-k1-p2sso</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.SK2PO}</div>skpo (sl1-k2tog-psso)</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.P3TOG}</div>p3tog</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.P3}</div>p3</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.M1LP}</div>m1lp</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.M1RP}</div>m1rp</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.PU}</div>pull up stitch</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.GP}</div>ghost purl</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.BRK}</div>brioche knit</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.BRP}</div>brioche purl</div>
+    <div class="leg"><div class="leg-cc" style="color:var(--ch-def-symbol)">${SYMS.SL}</div>slip st, wyif</div>
+  </div>`;
+  html += '</div>';
+
+  html += '</div>'; // chart-tracker
+  return html;
+}
+
+function centerOnCurrentRow() {
+  scrollChartToCurrent('smooth');
+}
+
+// ─────────────────────────────────────────────
+// ROW RECAP — plain-language summary of the stitches in a row.
+//
+// Patterns worked IN THE ROUND (e.g. Peacock Tee) have only one kind of
+// row: always read right → left, always the RS-facing stitch names. The
+// stored chart array is left → right, so that case always reverses it.
+//
+// Patterns worked FLAT (`PHASES[cur].flatChart`, e.g. Frost Flower)
+// alternate sides every row: odd rows are RS (right → left, RS stitch
+// names), even rows are WS (left → right — the stored array is already
+// left → right, so no reverse — WS stitch names). See isRSRow().
+//
+// `PHASES[cur].wsFirst` flips that parity — Posy's Chart 2 and back panel
+// are explicit about it ("this time all odd rows are on WS"), so row 1
+// there is WS, not RS. Everything else keeps the odd=RS default.
+//
+// `PHASES[cur].allWS` is a different shape entirely: every row in the
+// phase is WS, never alternating — for a pattern like Where are the Leaves,
+// where the RS (shaping) rows are a separate written phase with no chart of
+// their own, so THIS chart is only ever the WS half of each row pair.
+// ─────────────────────────────────────────────
+const STITCH_ABBR_RS = {
+  K: 'k', P: 'p', YO: 'yo', K2: 'k2tog', SK: 'ssk', M1: 'm1', M1L: 'M1L', M1R: 'M1R',
+  // Posy's symbols are drawn RS/WS-specific already (separate chart cells,
+  // not one glyph reinterpreted by side), so these read the same in both
+  // maps rather than swapping.
+  K2A: 'k2tog', SKA: 'ssk', M1LP: 'm1lp', M1RP: 'm1rp', SK2PO: 'sk2po',
+  P3TOG: 'p3tog', P3: 'p3', SSP: 'ssp', P2TOG: 'p2tog', KTBL: 'ktbl', PTBL: 'ptbl',
+  TK2TOG: 'tk2tog', TSSK: 'tssk', CDD: 'sl2-k1-p2sso', PU: 'pull up st',
+  GP: 'ghost purl', BRK: 'brk', BRP: 'brp', SL: 'sl1 wyif',
+};
+const STITCH_ABBR_WS = {
+  K: 'p', P: 'k', YO: 'yo', K2: 'p2tog', SK: 'ssp', M1: 'm1', M1L: 'M1LP', M1R: 'M1RP',
+  K2A: 'k2tog', SKA: 'ssk', M1LP: 'm1lp', M1RP: 'm1rp', SK2PO: 'sk2po',
+  P3TOG: 'p3tog', P3: 'p3', SSP: 'ssp', P2TOG: 'p2tog', KTBL: 'ktbl', PTBL: 'ptbl',
+  TK2TOG: 'tk2tog', TSSK: 'tssk', CDD: 'sl2-k1-p2sso', PU: 'pull up st',
+  GP: 'ghost purl', BRK: 'brk', BRP: 'brp', SL: 'sl1 wyif',
+};
+
+function isRSRow(row) {
+  const phase = PHASES[cur];
+  if (phase && phase.allWS) return false;
+  if (!(phase && phase.flatChart)) return true;
+  const oddIsRS = !phase.wsFirst;
+  return oddIsRS ? row % 2 === 1 : row % 2 === 0;
+}
+
+function rleStitches(types, abbr) {
+  const out = [];
+  for (let i = 0; i < types.length; ) {
+    let j = i;
+    while (j < types.length && types[j] === types[i]) j++;
+    const n = j - i, t = types[i];
+    if (t === 'K' || t === 'P') out.push(abbr[t] + n);
+    else out.push(n > 1 ? abbr[t] + ' ×' + n : abbr[t]);
+    i = j;
+  }
+  return out;
+}
+
+function collapseRepeats(tokens) {
+  const out = [];
+  for (let i = 0; i < tokens.length; ) {
+    let best = null;
+    const maxLen = Math.floor((tokens.length - i) / 2);
+    for (let L = 2; L <= maxLen; L++) {
+      let reps = 1;
+      while (i + (reps + 1) * L <= tokens.length) {
+        let match = true;
+        for (let k = 0; k < L; k++) {
+          if (tokens[i + k] !== tokens[i + reps * L + k]) { match = false; break; }
+        }
+        if (!match) break;
+        reps++;
+      }
+      if (reps >= 2 && (!best || reps * L > best.reps * best.len)) best = { len: L, reps };
+    }
+    if (best) {
+      out.push(`*${tokens.slice(i, i + best.len).join(', ')}* rep ${best.reps} times`);
+      i += best.len * best.reps;
+    } else {
+      out.push(tokens[i]);
+      i++;
+    }
+  }
+  return out;
+}
+
+function rowRecap(row) {
+  const phase = PHASES[cur];
+  const rs = isRSRow(row);
+  const rowData = CHART_B[row - 1];
+  if (!rowData) return '';
+  const abbr = (phase && phase.allWS) ? STITCH_ABBR_RS : (rs ? STITCH_ABBR_RS : STITCH_ABBR_WS);
+  const colors = chartColorRow(row);
+  let cells = rowData.map((t, i) => ({ t: parseColorCell(t).t, c: colors ? cellYarn(colors[i]) : null })).filter(x => x.t !== 'E');
+  if (rs) cells = cells.reverse(); // RS: right → left. WS: already stored left → right.
+  if (!cells.length) return '';
+  if (!cells.some(x => x.c !== null)) return collapseRepeats(rleStitches(cells.map(x => x.t), abbr)).join(', ');
+  // Coloured chart: one run per yarn change, each led by its swatch and
+  // name, so a two-colour row reads "■ Front: p5, k7 · ■ Back: k3" rather
+  // than hiding the change.
+  const yarns = (PHASES[cur] && PHASES[cur].chartYarns) || [];
+  const runs = [];
+  for (let i = 0; i < cells.length; ) {
+    let j = i;
+    while (j < cells.length && cells[j].c === cells[i].c) j++;
+    const c = cells[i].c;
+    const sw = c !== null
+      ? `${swatchHtml({ color: `var(--yarn-${c})`, size: 'xs', cls: 'recap-swatch' })}${yarns[c] ? escapeHtml(yarns[c].name) + ': ' : ''}`
+      : '';
+    runs.push(sw + collapseRepeats(rleStitches(cells.slice(i, j).map(x => x.t), abbr)).join(', '));
+    i = j;
+  }
+  return runs.join(' · ');
+}
+
+// A pattern where this chart is only HALF of each row pair (e.g. Where are
+// the Leaves' illusion knitting, where Section 1's RS shaping row has no
+// chart of its own) supplies `pairedRow(row)` on the phase — a plain string,
+// just that companion section's instruction, no metadata of its own — and
+// gets this two-subsection layout instead of the single-section one below.
+// One shared "Row N · work in <color>" heading covers both sections, since
+// it's the same physical row number and color either way; repeating it
+// twice (once per section) was what read as "conflicting" rather than
+// complementary.
+function pairedRecapHtml(row, phase, pairedText) {
+  const colorInfo = phase.allWS ? rowColorInfo(row) : null;
+  // The color is the one thing that actually changes what a knitter does
+  // with their hands right now (which ball of yarn to pick up) — it gets
+  // real weight here (a swatch dot + the row's biggest text), not the same
+  // small muted caps as the rest of the recap's metadata.
+  const headText = colorInfo
+    ? `${swatchHtml({ color: colorInfo.hex, round: true })}Row ${row} · work in ${escapeHtml(colorInfo.name)}`
+    : `Row ${row}`;
+  return `<div class="recap-title">${headText}</div>
+    <div class="recap-section">
+      <div class="recap-sub">Section 1</div>
+      <div class="recap-body">${pairedText}</div>
+    </div>
+    <div class="recap-section">
+      <div class="recap-sub">Section 2 · work from the chart</div>
+      <div class="recap-body">${rowRecap(row)}</div>
+    </div>`;
+}
+
+function recapHtml(row) {
+  const phase = PHASES[cur];
+  const flat = !!(phase && phase.flatChart);
+  const rs = isRSRow(row);
+  const pairedText = phase && typeof phase.pairedRow === 'function' ? phase.pairedRow(row) : null;
+
+  let html;
+  if (pairedText) {
+    html = pairedRecapHtml(row, phase, pairedText);
+  } else {
+    // Row-specific only — state what's true for THIS row, not a general
+    // rule covering both parities (flat patterns alternate RS/WS every row,
+    // so a blanket "odd rows.../even rows..." statement makes the reader
+    // work out which half applies to them; just say it directly instead).
+    const sideLabel = phase && phase.allWS ? 'work in ' + (rowColorName(row) || '?') : (rs ? 'RS' : 'WS');
+    const headText = flat
+      ? `Row ${row} (${sideLabel}) · read ${rs ? 'right → left' : 'left → right'}, bottom to top`
+      : `Work ${activePattern() && activePattern().custom ? 'the chart' : 'Chart B'} in the round · read right → left, bottom to top`;
+    html = `<div class="recap-head">${headText}</div>
+      <div class="recap-body"><strong>Row ${row}:</strong> ${rowRecap(row)}</div>`;
+  }
+
+  // Post-chart confirm step — the last step of the chart phase, surfaced
+  // alongside the row instructions (same "what do I do now" panel) rather
+  // than as a separate block further down. Only relevant once the last row
+  // is reached — it's the count you take after finishing the chart.
+  const confirmEntry = (PHASES[cur].entries || []).find(e => e.postChart);
+  if (confirmEntry && row === CHART_TOTAL) {
+    const done = entryDone(confirmEntry, entryProg);
+    html += `<div class="chart-confirm-step ${done ? 'done' : ''}"${checkboxAttrs(done)} onclick="toggleEntry('${confirmEntry.id}')">
+      ${checkHtml()}
+      <div class="step-text">${confirmEntry.text}</div>
+    </div>`;
+  }
+  return html;
+}
+
+function renderChartDock() {
+  const dock = document.getElementById('chart-dock');
+  let html = `<div class="chart-recap" id="chart-recap">${recapHtml(chartCurrentRow)}</div>`;
+  html += `<div class="chart-footer">
+    ${stepperBtnHtml({ dir: 'minus', size: 'lg', onclick: 'changeChartRow(-1)', label: 'Previous row' })}
+    <div class="cc-stats">
+      <span class="cc-stat-lbl">Current row</span>
+      <span class="cc-cur-val" id="cc-cur">${chartCurrentRow}</span>
+      <span class="cc-total-lbl">Total rows ${CHART_TOTAL}</span>
+    </div>
+    ${stepperBtnHtml({ dir: 'plus', size: 'lg', onclick: 'changeChartRow(1)', label: 'Next row' })}
+  </div>`;
+
+  html += '<div class="nav-btns" id="chart-nav-btns">';
+  if (cur > 0) html += btnHtml({ label: '← Back', variant: 'lg', cls: 'nav-btn', onclick: `go(${cur - 1})` });
+  if (cur < PHASES.length - 1) html += btnHtml({ label: 'Next →', variant: ['primary', 'lg'], cls: 'nav-btn', onclick: `go(${cur + 1})` });
+  else html += btnHtml({ label: 'Finished! 🎉', variant: ['primary', 'lg'], cls: 'nav-btn', onclick: 'showFinishedScreen()' });
+  html += '</div>';
+
+  dock.innerHTML = html;
+}
+
+// ─────────────────────────────────────────────
+// CHART SCROLL — centre current row in viewport
+// ─────────────────────────────────────────────
+
+// CRITICAL: must match .crow CSS height exactly. If changed, update index.html
+// `.crow { height: calc(var(--cell-sz) + 1px); }` in parallel. Mismatch breaks
+// row alignment with mid-row line and scroll centering.
+function getRowH() { return cellSz + 1; }
+
+function scrollChartToCurrent(behavior) {
+  // Centre the current row in the chart viewport. The viewport itself grows
+  // and shrinks as the panels collapse/expand, so a plain centre is enough —
+  // the visible area is always exactly the space left by the panels.
+  const vp = document.getElementById('chart-vp');
+  const inner = document.getElementById('chart-inner');
+  if (!vp || !inner) return;
+
+  const vpH = vp.clientHeight;
+  const ROW_H = getRowH();
+  const visIdx = CHART_TOTAL - chartCurrentRow; // row 44 = index 0 (top), row 1 = index 43 (bottom)
+  const padTop = parseFloat(getComputedStyle(inner).paddingTop) || 8;
+  const rowCenter = padTop + visIdx * ROW_H + ROW_H / 2;
+  const target = rowCenter - vpH / 2;
+  const maxScroll = inner.scrollHeight - vpH;
+
+  vp.scrollTo({ top: Math.max(0, Math.min(maxScroll, target)), behavior: behavior || 'instant' });
+}
+
+function smartScrollChart(rowEl, delta) {
+  // Keep the active row centered in the viewport once it reaches the midpoint
+  // in the direction of travel.
+  // Going up (+): track once row hits the upper half.
+  // Going down (−): track once row hits the lower half.
+  if (!rowEl) return;
+  const vp = document.getElementById('chart-vp');
+  if (!vp) return;
+
+  const vpRect = vp.getBoundingClientRect();
+  const rowRect = rowEl.getBoundingClientRect();
+  const centerY = vpRect.top + vpRect.height / 2;
+  const rowCenterY = rowRect.top + rowRect.height / 2;
+
+  const shouldScroll = delta > 0 ? rowCenterY <= centerY : rowCenterY >= centerY;
+  if (shouldScroll) {
+    const target = vp.scrollTop + (rowCenterY - centerY);
+    const maxScroll = vp.scrollHeight - vpRect.height;
+    vp.scrollTo({ top: Math.max(0, Math.min(maxScroll, target)), behavior: 'smooth' });
+  }
+}
+
+function resizeChart(delta) {
+  cellSz = Math.max(10, Math.min(32, cellSz + delta));
+  document.documentElement.style.setProperty('--cell-sz', cellSz + 'px');
+  // ROW_H (== cellSz + 1) changed, so every spacer height is now stale —
+  // remount before scrolling, since scrollChartToCurrent's maxScroll clamp
+  // reads the real #chart-inner.scrollHeight.
+  mountChartWindow(chartWindowRange(), true);
+  updateMidRowLine();
+  save();
+  // Not requestAnimationFrame(scrollChartToCurrent) directly — rAF calls back
+  // with a timestamp, which would land in scrollChartToCurrent's `behavior`
+  // param and throw on scrollTo (invalid ScrollBehavior).
+  requestAnimationFrame(() => scrollChartToCurrent());
+}
+
+// ─────────────────────────────────────────────
+// MID-ROW TRACKER — a bright line marking a stitch-column boundary, shared
+// across every row of the current chart, plus a drag handle sitting right
+// below it. Snaps to column gaps, scrolls with the chart content (the line
+// lives inside #chart-inner, not #chart-vp), and is local-only: see the
+// pt3_proj_<id>_midRowPos comment in storage.js for why it never goes
+// through stampClock/sync.
+//
+// The handle is deliberately NOT inside #chart-inner: it needs to stay
+// grabbable at a fixed height in the viewport regardless of vertical scroll,
+// so it lives in #chart-stage instead (like the zoom/recenter FABs) and its
+// `left` is recomputed from the line's content position minus the
+// viewport's own horizontal scroll — the one thing that can move the two
+// out of sync between renders.
+// ─────────────────────────────────────────────
+// .crow has NO left padding (see index.html) — the sticky left row-number
+// cell has to be flush with .crow's own edge from the first pixel of
+// scroll, or it visibly slides that padding's distance before settling
+// into its stuck position. So the only offset before the first real stitch
+// column is the row-number cell itself (border-box, so its rendered width
+// is exactly --cell-sz) plus ROWNUM_GAP, which must mirror .cc-rownum-l's
+// margin-right (index.html).
+const MID_ROW_GAP = 1, ROWNUM_GAP = 4;
+
+// Column index → pixel offset within #chart-inner. cellSz drives both the
+// per-column spacing AND (via the sticky row-number cell) the left offset
+// itself, so the whole thing is read live rather than baked into a constant.
+function midRowLeftPad() {
+  return cellSz + ROWNUM_GAP;
+}
+function midRowX(colIdx) {
+  return midRowLeftPad() + (colIdx - chartColStart) * (cellSz + MID_ROW_GAP) - MID_ROW_GAP / 2;
+}
+
+function updateMidRowLine() {
+  const inner = document.getElementById('chart-inner');
+  if (!inner) return;
+  inner.style.setProperty('--mid-row-x', midRowX(midRowColIdx) + 'px');
+  updateMidRowHandle();
+}
+
+// Re-anchors the handle under the line's current on-screen position. Called
+// after any change to midRowColIdx/cellSz, and on every horizontal scroll of
+// #chart-vp (wired via the vp's inline onscroll), since scrolling moves the
+// line under a handle that doesn't scroll with it.
+function updateMidRowHandle() {
+  const vp = document.getElementById('chart-vp');
+  const handle = document.getElementById('mid-row-handle');
+  if (!vp || !handle) return;
+  const viewportX = midRowX(midRowColIdx) - vp.scrollLeft;
+  handle.style.left = Math.max(0, Math.min(vp.clientWidth, viewportX)) + 'px';
+}
+
+function changeMidRowPos(newColIndex) {
+  const phase = PHASES[cur];
+  if (!phase) return;
+  const stitchCount = CHART_B[0] ? CHART_B[0].length : 0;
+  const clamped = Math.max(0, Math.min(stitchCount, newColIndex));
+  if (clamped === midRowColIdx) return; // clamped drag — nothing moved, nothing to save
+  midRowColIdx = clamped;
+  midRowPos[phase.id] = midRowColIdx;
+  updateMidRowLine();
+  save();
+}
+
+function startMidRowDrag(evt) {
+  const inner = document.getElementById('chart-inner');
+  if (!inner) return;
+  evt.preventDefault();
+  const stitchCount = CHART_B[0] ? CHART_B[0].length : 0;
+
+  // #chart-inner's own bounding rect already reflects the viewport's current
+  // scroll position, so a pointer's clientX maps straight to a content
+  // x-offset without needing to add scrollLeft back in.
+  const colFromEvent = e => {
+    const relX = e.clientX - inner.getBoundingClientRect().left;
+    const col = chartColStart + Math.round((relX - midRowLeftPad() + MID_ROW_GAP / 2) / (cellSz + MID_ROW_GAP));
+    return Math.max(0, Math.min(stitchCount, col));
+  };
+  // Live visual feedback every move, without writing to storage on every
+  // pixel of travel — same reasoning as resizeChart not persisting mid-gesture.
+  const preview = col => {
+    const inn = document.getElementById('chart-inner');
+    const handle = document.getElementById('mid-row-handle');
+    const vp = document.getElementById('chart-vp');
+    if (!inn || !handle || !vp) return;
+    inn.style.setProperty('--mid-row-x', midRowX(col) + 'px');
+    const viewportX = midRowX(col) - vp.scrollLeft;
+    handle.style.left = Math.max(0, Math.min(vp.clientWidth, viewportX)) + 'px';
+  };
+
+  preview(colFromEvent(evt));
+  const onMove = e => preview(colFromEvent(e));
+  const onUp = e => {
+    document.removeEventListener('pointermove', onMove);
+    document.removeEventListener('pointerup', onUp);
+    changeMidRowPos(colFromEvent(e));
+  };
+  document.addEventListener('pointermove', onMove);
+  document.addEventListener('pointerup', onUp);
+}
+
+function changeChartRow(delta) {
+  // The clamp lives in the model, beside the repeat's, because it IS the
+  // repeat's: a chart is one pass with no inside, so advancing it is the same
+  // operation minus the pass arithmetic. What stays here is the targeted DOM
+  // update and the scroll — the parts that are genuinely the chart's own.
+  const entry = chartEntryFor(PHASES[cur], activeDoc);
+  if (!entry) return;
+  const prevRow = chartCurrentRow;
+  chartCurrentRow = advanceChartRow(entry, chartCurrentRow, delta);
+  if (chartCurrentRow === prevRow) return; // clamped tap — nothing moved, nothing to stamp
+  // Remember this phase's own position, so switching to another chart phase
+  // and back returns to the row you were on rather than a shared one.
+  if (PHASES[cur]) {
+    chartRows[PHASES[cur].id] = chartCurrentRow;
+    // Per-phase row means a per-phase clock. A single 'chart_row' key would
+    // make two devices sitting on two different chart phases look like they
+    // were fighting over one field, and merging them would move somebody to a
+    // row of a chart they aren't knitting.
+    stampClock(chartRowKey(PHASES[cur].id));
+  }
+  // No tally nudge here any more — the Rows total is derived from
+  // chartRows/entryProg on read (globalRowsNow()), and save() stamps
+  // global_rows if the derived value actually moved.
+  renderGlobalRows();
+  save();
+
+  // Targeted DOM update — no full re-render, EXCEPT the rows are virtualized
+  // now, so the previous or new row may simply not be mounted (a tap past
+  // the edge of the rendered window, or a jump via the row counter). That's
+  // the rare case — taps move one row at a time and the active row is kept
+  // centered, so almost always both are already in the DOM and the fast
+  // path below fires. Only fall back to remounting the window when it isn't.
+  const prevEl = document.querySelector('.crow[data-row="' + prevRow + '"]');
+  let newEl = document.querySelector('.crow[data-row="' + chartCurrentRow + '"]');
+
+  if (!prevEl || !newEl) {
+    mountChartWindow(chartWindowRange(), true);
+    newEl = document.querySelector('.crow[data-row="' + chartCurrentRow + '"]');
+  } else {
+    prevEl.classList.remove('crow-active');
+    prevEl.querySelectorAll('.cc-rownum').forEach(num => {
+      num.classList.remove('crow-num-active');
+      if (prevRow < chartCurrentRow) num.classList.add('crow-num-done');
+      else num.classList.remove('crow-num-done');
+    });
+    repaintRowColors(prevEl, false);
+    newEl.classList.add('crow-active');
+    newEl.querySelectorAll('.cc-rownum').forEach(num => {
+      num.classList.remove('crow-num-done');
+      num.classList.add('crow-num-active');
+    });
+    repaintRowColors(newEl, true);
+  }
+
+  const ccur = document.getElementById('cc-cur');
+  if (ccur) ccur.textContent = chartCurrentRow;
+  const recap = document.getElementById('chart-recap');
+  if (recap) recap.innerHTML = recapHtml(chartCurrentRow);
+
+  // Smart scroll: keep active row centered once it reaches the viewport midpoint
+  smartScrollChart(newEl, delta);
+}
